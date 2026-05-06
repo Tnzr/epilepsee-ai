@@ -1,0 +1,107 @@
+# Wearable-specific TCN configuration with focal loss and milder augmentation
+
+experiment_name: "wearable_tcn_focal"
+description: "TCN countdown model on wearable dataset with focal loss and class-balanced training"
+tags:
+  - wearable
+  - tcn
+  - focal-loss
+
+data:
+  # Root for the Oregon wearable dataset (override via CLI if needed)
+  dataset_root: "/media/tnzr/HDD11/Datasets/WearablwDevice-Oregon"
+
+  # Keep the same feature extraction window/step as default; CLI may override
+  feature_window_s: 60.0
+  feature_step_s: 1.0
+  pre_ictal_window_s: 1800.0
+
+  # Use the same train/val/test splits as default
+  train_ratio: 0.60
+  val_ratio: 0.15
+  test_ratio: 0.25
+
+  # Wearable safety caps (kept conservative)
+  max_wearable_global_samples: 50000
+  max_wearable_nonseizure_recordings: 40
+
+  # Enable moderate preictal-only augmentation for wearable runs.
+  # This expands scarce positive examples without excessively
+  # distorting the overall interictal:preictal ratio.
+  augment_preictal: true
+  augmentation_factor: 4
+
+model:
+  model_type: "tcn"
+  ecg_feature_dim: 14
+  dropout: 0.3
+
+loss:
+  # Binary-diagnostic run: focus entirely on classification to
+  # verify that the wearable features support a meaningful
+  # preictal vs interictal separator.
+  classification_weight: 1.0
+  regression_weight: 0.0
+  ranking_weight: 0.0
+
+  regression_loss: "weighted_mse"
+  weight_tau: 60.0
+  label_smoothing: 0.0
+
+  # Use class-weighted BCE for the preictal classification head.
+  # A moderate positive weight discourages the degenerate
+  # "always preictal" or "always interictal" solutions.
+  classification_loss_type: "bce"
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+  use_class_weighting: true
+  classification_positive_weight: 5.0
+
+training:
+  optimizer: "adam"
+  learning_rate: 0.0005
+  weight_decay: 1.0e-5
+
+  num_epochs: 60
+  batch_size: 1
+  num_workers: 4
+  pin_memory: true
+
+  gradient_clip_norm: 1.0
+  gradient_accumulation_steps: 1
+
+  # For wearable runs we rely on focal loss + temporal weighting
+  # rather than a WeightedRandomSampler.
+  use_weighted_sampling: false
+
+  early_stopping: true
+  early_stopping_patience: 15
+  early_stopping_metric: "val_mae"
+
+  distributed: true
+  num_gpus: 2
+  backend: "nccl"
+
+  save_dir: "/home/tnzr/Documents/FIU/Research/Epilepsee-AI/models"
+  save_interval: 5
+  save_best_only: true
+  resume_from: null
+
+  log_dir: "/home/tnzr/Documents/FIU/Research/Epilepsee-AI/logs"
+  log_interval: 100
+  use_tensorboard: true
+
+evaluation:
+  compute_mae: true
+  compute_rmse: true
+  compute_medae: true
+
+  lead_time_thresholds: [3.0, 5.0, 10.0]
+  fpr_window_hours: 8.0
+  stability_window: 30
+
+  classification_thresholds: [0.3, 0.5, 0.7]
+
+  compute_loso_cv: true
+  num_cv_folds: null

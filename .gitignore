@@ -1,0 +1,119 @@
+# =============================================================================
+# Epilepsee-AI — .gitignore
+# =============================================================================
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.pyo
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+.installed.cfg
+pip-wheel-metadata/
+
+# ─── Virtual environments / Conda ────────────────────────────────────────────
+.venv/
+venv/
+env/
+.conda/
+*.conda
+
+# ─── Secrets & environment variables ─────────────────────────────────────────
+.env
+.env.*
+!.env.example
+secrets.yaml
+secrets.json
+*.key
+*.pem
+*.crt
+*.p12
+wandb_api_key.txt
+netrc
+.netrc
+
+# ─── Weights & Biases run artifacts (contain personal email, local paths) ────
+wandb/
+.wandb/
+
+# ─── Trained models & checkpoints ────────────────────────────────────────────
+models/
+!models/.gitkeep
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.hdf5
+*.pkl
+
+# ─── Datasets (never commit raw data) ────────────────────────────────────────
+data/
+datasets/
+*.edf
+*.bdf
+*.csv
+*.parquet
+*.feather
+*.npz
+*.npy
+!tests/fixtures/**/*.npz
+!tests/fixtures/**/*.npy
+
+# ─── Generated outputs ───────────────────────────────────────────────────────
+visualizations/
+test_visualizations/
+outputs/
+results/
+
+# ─── IDE / Editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Jupyter ─────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Coverage & testing artifacts ────────────────────────────────────────────
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+
+# ─── MyPy / Type checking ────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ─── Documentation builds ────────────────────────────────────────────────────
+docs/_build/
+site/
+
+# ─── OS-generated ────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db

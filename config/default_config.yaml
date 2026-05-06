@@ -1,0 +1,141 @@
+# Default configuration for seizure anticipation training
+
+experiment_name: "seizure_anticipation_ecg_lstm"
+description: "ECG-only LSTM model for seizure countdown prediction"
+tags:
+  - baseline
+  - ecg-only
+  - lstm
+
+# Data configuration
+data:
+  dataset_root: "${BIDS_DATASET_ROOT:/path/to/datasets/ds005873}"
+  output_dir: "./data"
+  
+  sampling_rate_high: 250
+  sampling_rate_motion: 25
+  
+  ecg_lowcut: 0.5
+  ecg_highcut: 40.0
+  motion_threshold: 1.0
+  
+  feature_window_s: 60.0
+  feature_step_s: 1.0
+  pre_ictal_window_s: 1800.0
+  
+  train_ratio: 0.60
+  val_ratio: 0.15
+  test_ratio: 0.25
+  
+  cv_strategy: "loso"
+  random_seed: 42
+
+  # Safety cap for wearable (OHSU) real-mode datasets.
+  # When training with DATA_SOURCE=wearable, the total number of
+  # windowed samples across all recordings will be trimmed to at most
+  # this many samples after feature extraction. This prevents host RAM
+  # exhaustion when feature_step_s is small and recordings are long,
+  # especially under DDP where multiple ranks share the cached dataset.
+  max_wearable_global_samples: 50000
+
+  # Wearable-specific recording selection: maximum number of recordings
+  # that contain no seizures to include in real-mode runs. This keeps
+  # long purely interictal recordings from dominating the dataset and
+  # consuming RAM without adding preictal coverage.
+  max_wearable_nonseizure_recordings: 40
+
+# Model configuration
+model:
+  model_type: "ecg_lstm"  # ecg_lstm, cnn_lstm, or multimodal
+  
+  ecg_feature_dim: 14
+  eeg_feature_dim: 6
+  motion_feature_dim: 2
+  
+  hidden_dim: 128
+  num_lstm_layers: 2
+  bidirectional: true
+  
+  use_attention: true
+  num_attention_heads: 4
+  
+  dropout: 0.3
+  use_batch_norm: true
+  
+  output_countdown_max: 10.0
+  init_method: "xavier"
+
+# Loss configuration
+loss:
+  classification_weight: 0.3
+  regression_weight: 0.7
+  ranking_weight: 0.0
+  
+  regression_loss: "weighted_mse"
+  weight_tau: 60.0
+  label_smoothing: 0.0
+  # Classification loss: "bce" (default) or "focal".
+  classification_loss_type: "bce"
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  # For highly imbalanced wearable runs we rely on temporal weighting
+  # and augmentation rather than very large BCE class weights, which
+  # can destabilize training. Class weighting can be re-enabled in a
+  # custom config if needed.
+  use_class_weighting: false
+  classification_positive_weight: null
+
+# Training configuration
+training:
+  optimizer: "adam"
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  momentum: 0.9
+  
+  lr_scheduler: "reduce_on_plateau"
+  lr_factor: 0.5
+  lr_patience: 10
+  lr_min: 0.000001
+  
+  num_epochs: 100
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  
+  gradient_clip_norm: 1.0
+  gradient_accumulation_steps: 1
+  use_weighted_sampling: false
+  long_sweep_training: false
+  epoch_panel_window_minutes: 180.0
+  
+  early_stopping: true
+  early_stopping_patience: 15
+  early_stopping_metric: "val_mae"
+  
+  distributed: true
+  num_gpus: 2
+  backend: "nccl"
+  
+  save_dir: "./models"
+  save_interval: 5
+  save_best_only: true
+  resume_from: null
+  
+  log_dir: "./logs"
+  log_interval: 100
+  use_tensorboard: true
+
+# Evaluation configuration
+evaluation:
+  compute_mae: true
+  compute_rmse: true
+  compute_medae: true
+  
+  lead_time_thresholds: [3.0, 5.0, 10.0]
+  fpr_window_hours: 8.0
+  stability_window: 30
+  
+  classification_thresholds: [0.3, 0.5, 0.7]
+  
+  compute_loso_cv: true
+  num_cv_folds: null
