@@ -70,6 +70,10 @@ class DataConfig:
     # Data augmentation for preictal samples
     augment_preictal: bool = True
     augmentation_factor: int = 15  # Augment each preictal sample N times
+    # Long-sweep compatible augmentation: apply stochastic transforms
+    # online in __getitem__ instead of materializing augmented arrays.
+    online_preictal_augmentation: bool = True
+    online_preictal_augmentation_prob: float = 0.7
     aug_time_warp_rates: List[float] = field(default_factory=lambda: [0.90, 0.95, 1.05, 1.10])
     aug_amplitude_scales: List[float] = field(default_factory=lambda: [0.85, 0.90, 1.10, 1.15])
     aug_noise_levels: List[float] = field(default_factory=lambda: [0.01, 0.02, 0.03])

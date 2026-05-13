@@ -20,6 +20,8 @@ import logging
 import argparse
 import hashlib
 import time
+import shutil
+import tempfile
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -214,10 +216,41 @@ def parse_args():
         '--long-sweep-training',
         action='store_true',
         help=(
-            'Enable day-like continuous sweep training: preserve chronological '
-            'order within recordings, split by recording (no cross-split leakage), '
-            'and disable random/context subsampling shortcuts.'
+            'Enable long-sweep training mode: keep all chronological windows per recording '
+            'to mimic true day-long streaming operation. Disables per-recording sample capping.'
         )
+    )
+
+    parser.add_argument(
+        '--patient-sequential',
+        action='store_true',
+        help=(
+            'Enable patient-by-patient sequential training: split by patient to avoid '
+            'cross-patient data mixing, then process each patient\'s recordings sequentially. '
+            'Prevents memory issues and improves generalization by avoiding unrelated sample mixing.'
+        )
+    )
+
+    parser.add_argument(
+        '--augment-preictal',
+        dest='augment_preictal',
+        action='store_true',
+        default=None,
+        help='Enable preictal augmentation (offline for non-long-sweep, online for long-sweep).'
+    )
+
+    parser.add_argument(
+        '--no-augment-preictal',
+        dest='augment_preictal',
+        action='store_false',
+        help='Disable preictal augmentation.'
+    )
+
+    parser.add_argument(
+        '--online-aug-prob',
+        type=float,
+        default=None,
+        help='Override long-sweep online preictal augmentation probability in [0,1].'
     )
 
     parser.add_argument(
@@ -269,7 +302,37 @@ def parse_args():
         default=None,
         help='Local rank passed by distributed launchers'
     )
-    
+
+    # ── Safe 3-state classification loss (no GT countdown regression) ─────────
+    parser.add_argument(
+        '--state-loss',
+        action='store_true',
+        help=(
+            'Use SeizureStateLoss (safe 3-class: interictal / pre-ictal / onset). '
+            'GT countdown is used only to bucket labels — no regression is performed, '
+            'so the model does NOT learn exact timing from future seizure annotations.'
+        )
+    )
+    parser.add_argument(
+        '--onset-threshold-min',
+        type=float,
+        default=2.0,
+        help='Minutes before seizure that define the "onset" bucket (default 2.0).'
+    )
+
+    # ── Temporal ring-buffer training ─────────────────────────────────────────
+    parser.add_argument(
+        '--ring-buffer-size',
+        type=int,
+        default=0,
+        help=(
+            'Enable temporal ring-buffer training: expose only the most recent N samples '
+            'to the model per epoch, evicting older history. '
+            '0 (default) disables windowing and uses the full dataset each epoch. '
+            'Simulates deployment conditions where the device has only seen data since it was turned on.'
+        )
+    )
+
     return parser.parse_args()
 
 
@@ -295,6 +358,186 @@ def _extract_seizure_onsets(events_df) -> np.ndarray:
 
     onsets = events_df.loc[seizure_mask, 'onset'].astype(float).values
     return np.sort(onsets.astype(np.float32))
+
+
+# Per-process memory-mapped signal cache.  Each DataLoader worker forks a
+# separate copy so there is no multiprocessing contention.
+_MMAP_CACHE: dict = {}
+
+
+class LazyRealDataset(torch.utils.data.Dataset):
+    """Streaming BIDS dataset – stores only window metadata; features are
+    computed on-the-fly in __getitem__ from raw float32 signal binary files.
+
+    This eliminates the need to pre-cache hundreds of GB of feature tensors.
+    Binary signal files are stored once (22 GB total for ds005873) on the same
+    disk as the EDF dataset; feature computation is cheap (~600 µs/window).
+    """
+
+    def __init__(
+        self,
+        rec_indices: np.ndarray,       # (N,) int32 – index into recordings_meta
+        end_indices: np.ndarray,       # (N,) int64 – end sample index
+        labels: np.ndarray,            # (N,) float32
+        sample_end_times_s: np.ndarray,  # (N,) float32
+        recording_ids: np.ndarray,     # (N,) str
+        recordings_meta: list,         # [{signal_path, fs, seq_samples, n_samples}, ...]
+        feature_dim: int,
+        subject_ids: Optional[np.ndarray] = None,
+    ):
+        self.rec_indices = np.asarray(rec_indices, dtype=np.int32)
+        self.end_indices = np.asarray(end_indices, dtype=np.int64)
+        self.labels = np.asarray(labels, dtype=np.float32)
+        self.sample_end_times_s = np.asarray(sample_end_times_s, dtype=np.float32)
+        self.recording_ids = np.asarray(recording_ids)
+        self.recordings_meta = recordings_meta
+        self.feature_dim = feature_dim
+        self.subject_ids = subject_ids
+
+        self.preictal_labels = (self.labels >= 0).astype(np.float32)
+        self.weights = self._compute_weights(self.labels)
+
+        # Online augmentation flags (mirror SeizureDataset interface)
+        self._online_aug_enabled = False
+        self._online_aug_probability = 0.0
+        self._online_aug_preictal_only = True
+        self._online_aug_cfg = None
+        self._online_aug_rng = None
+
+        logger.info(
+            "LazyRealDataset: %d windows, feature_dim=%d, %d unique recordings",
+            len(self),
+            feature_dim,
+            len(recordings_meta),
+        )
+
+    # ------------------------------------------------------------------
+    def _compute_weights(self, labels: np.ndarray) -> np.ndarray:
+        if labels.size == 0:
+            return np.array([], dtype=np.float32)
+        tau = 60.0
+        weights = np.where(labels >= 0, np.exp(-np.maximum(labels, 0.0) * 60 / tau), 0.5)
+        return (weights / np.mean(weights)).astype(np.float32)
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, idx: int):
+        rec_idx = int(self.rec_indices[idx])
+        end_idx = int(self.end_indices[idx])
+        label = float(self.labels[idx])
+
+        meta = self.recordings_meta[rec_idx]
+        signal_path: str = meta["signal_path"]
+        seq_samples: int = int(meta["seq_samples"])
+        n_samples: int = int(meta["n_samples"])
+
+        # Memory-map the raw signal (lazy OS-level caching, no copy)
+        if signal_path not in _MMAP_CACHE:
+            _MMAP_CACHE[signal_path] = np.memmap(
+                signal_path, dtype=np.float32, mode="r", shape=(n_samples,)
+            )
+        signal = _MMAP_CACHE[signal_path]
+
+        start_idx = max(0, end_idx - seq_samples)
+        segment = np.array(signal[start_idx:end_idx], dtype=np.float32)
+        if len(segment) < seq_samples:
+            segment = np.pad(segment, (seq_samples - len(segment), 0), mode="edge")
+
+        features = _segment_to_feature_matrix(segment, self.feature_dim, target_steps=600)
+
+        if (
+            self._online_aug_enabled
+            and self._online_aug_rng is not None
+            and (label >= 0 or not self._online_aug_preictal_only)
+            and float(self._online_aug_rng.random()) < self._online_aug_probability
+        ):
+            features = features.copy()
+            cfg = self._online_aug_cfg
+            if cfg is not None:
+                noise_std = float(getattr(cfg, "noise_std", 0.02))
+                if noise_std > 0:
+                    features += self._online_aug_rng.normal(
+                        0, noise_std, features.shape
+                    ).astype(np.float32)
+
+        weight = float(self.weights[idx])
+        return (
+            torch.from_numpy(features),
+            torch.tensor(label, dtype=torch.float32),
+            torch.tensor(weight, dtype=torch.float32),
+        )
+
+    # ------------------------------------------------------------------
+    @property
+    def class_distribution(self) -> dict:
+        return {
+            "preictal": int(np.sum(self.labels >= 0)),
+            "interictal": int(np.sum(self.labels < 0)),
+        }
+
+    @property
+    def features(self):
+        raise AttributeError(
+            "LazyRealDataset does not materialise a .features array. "
+            "Use __getitem__ / DataLoader for feature access."
+        )
+
+
+def _ensure_raw_signal_cache(
+    recording: dict,
+    loader: "BIDSDataLoader",
+    signal_cache_dir: Path,
+) -> Tuple[Path, float, int]:
+    """Return path to a raw float32 ECG binary for *recording*.
+
+    If the file does not already exist it is created by loading the EDF and
+    writing the first channel as a contiguous float32 array.  The file is
+    stored in *signal_cache_dir* (typically co-located with the EDF dataset
+    on the same large disk).
+
+    Returns (binary_path, fs, n_samples).
+    """
+    uid = (
+        f"sub-{recording['subject_id']}"
+        f"_ses-{recording['session_id']}"
+        f"_run-{recording['run_id']}"
+    )
+    bin_path = signal_cache_dir / f"{uid}_ecg.f32"
+    meta_path = signal_cache_dir / f"{uid}_ecg.json"
+
+    if bin_path.exists() and meta_path.exists():
+        with open(meta_path) as fh:
+            m = json.load(fh)
+        return bin_path, float(m["fs"]), int(m["n_samples"])
+
+    # Load EDF and extract first channel
+    ecg_data, fs = loader.load_subject_edf(
+        recording["subject_id"],
+        recording["session_id"],
+        "ecg",
+        recording["run_id"],
+    )
+    signal_1d = (ecg_data[0] if ecg_data.ndim > 1 else ecg_data).astype(np.float32)
+    n_samples = len(signal_1d)
+
+    # Write raw float32 binary
+    tmp = bin_path.with_suffix(".tmp")
+    try:
+        signal_1d.tofile(str(tmp))
+        tmp.rename(bin_path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        del signal_1d
+        del ecg_data
+
+    with open(meta_path, "w") as fh:
+        json.dump({"fs": float(fs), "n_samples": n_samples}, fh)
+
+    return bin_path, float(fs), n_samples
 
 
 def _segment_to_feature_matrix(segment: np.ndarray, feature_dim: int, target_steps: int = 600) -> np.ndarray:
@@ -383,15 +626,34 @@ def _align_feature_matrix(feature_mat: np.ndarray, feature_dim: int, target_step
     return padded
 
 
-def _select_recordings_for_real_mode(recordings: List[dict], max_recordings: int) -> List[dict]:
-    """Select recordings with seizure-first prioritization for better preictal coverage."""
+def _select_recordings_for_real_mode(recordings: List[dict], max_recordings: int, loader: BIDSDataLoader) -> List[dict]:
+    """Select recordings with seizure-first prioritization for better preictal coverage.
+    
+    Only includes recordings that actually have the required data files.
+    """
     if max_recordings and max_recordings > 0:
         candidates = recordings[:]
     else:
         candidates = recordings
 
-    seizure_recs = [recording for recording in candidates if int(recording.get('num_seizures', 0)) > 0]
-    nonseizure_recs = [recording for recording in candidates if int(recording.get('num_seizures', 0)) <= 0]
+    # Filter to only recordings that have ECG data files
+    valid_candidates = []
+    for recording in candidates:
+        try:
+            loader.resolve_subject_edf_path(
+                recording['subject_id'],
+                recording['session_id'],
+                'ecg',
+                recording['run_id']
+            )
+            valid_candidates.append(recording)
+        except FileNotFoundError:
+            continue  # Skip recordings without data files
+    
+    logger.info(f"Filtered to {len(valid_candidates)} recordings with actual data files out of {len(candidates)} candidates")
+
+    seizure_recs = [recording for recording in valid_candidates if int(recording.get('num_seizures', 0)) > 0]
+    nonseizure_recs = [recording for recording in valid_candidates if int(recording.get('num_seizures', 0)) <= 0]
 
     seizure_recs.sort(key=lambda recording: int(recording.get('num_seizures', 0)), reverse=True)
 
@@ -399,7 +661,7 @@ def _select_recordings_for_real_mode(recordings: List[dict], max_recordings: int
     if max_recordings and max_recordings > 0:
         n_target = max_recordings
     else:
-        n_target = len(candidates)
+        n_target = len(valid_candidates)
 
     selected.extend(seizure_recs[:n_target])
     if len(selected) < n_target:
@@ -494,7 +756,7 @@ def _sort_indices_by_timeline(indices: np.ndarray,
     return indices[order].astype(np.int64)
 
 
-def _split_indices_by_recording_timeline(
+def _split_indices_by_patient_sequential(
     y: np.ndarray,
     recording_ids: np.ndarray,
     sample_end_times_s: np.ndarray,
@@ -502,44 +764,58 @@ def _split_indices_by_recording_timeline(
     val_ratio: float,
     seed: int,
 ):
-    """Split by recording to avoid leakage, then keep timeline order within each split."""
+    """Split by patient (subject) for sequential training, avoiding cross-patient data mixing.
+
+    This ensures each patient appears in only one split (train/val/test), and within
+    each split, maintains chronological order within recordings. This prevents
+    data leakage and memory issues from mixing unrelated patient samples.
+    """
     rng = np.random.default_rng(seed)
 
     y = np.asarray(y, dtype=np.float32)
     recording_ids = np.asarray(recording_ids)
     sample_end_times_s = np.asarray(sample_end_times_s, dtype=np.float64)
 
-    unique_recs = np.unique(recording_ids)
-    if unique_recs.size == 0:
+    # Extract subject_ids from recording_ids (format: "sub-{subject_id}_ses-{session_id}_run-{run_id}")
+    subject_ids = np.array([rec_id.split('_')[0].replace('sub-', '') for rec_id in recording_ids])
+
+    unique_subjects = np.unique(subject_ids)
+    if unique_subjects.size == 0:
         empty = np.array([], dtype=np.int64)
         return empty, empty, empty
 
-    rec_meta = []
-    for rec_id in unique_recs:
-        rec_idx = np.where(recording_ids == rec_id)[0]
-        if rec_idx.size == 0:
+    # Group recordings by subject
+    subject_meta = []
+    for subj_id in unique_subjects:
+        subj_mask = subject_ids == subj_id
+        subj_indices = np.where(subj_mask)[0]
+        if subj_indices.size == 0:
             continue
-        rec_meta.append(
-            {
-                'rec_id': rec_id,
-                'n': int(rec_idx.size),
-                'has_preictal': bool(np.any(y[rec_idx] >= 0)),
-                't0': float(np.min(sample_end_times_s[rec_idx])),
-            }
-        )
 
-    if len(rec_meta) == 0:
+        subj_recordings = recording_ids[subj_mask]
+        unique_recs = np.unique(subj_recordings)
+        n_samples = int(subj_indices.size)
+        has_preictal = bool(np.any(y[subj_indices] >= 0))
+
+        subject_meta.append({
+            'subj_id': subj_id,
+            'n_samples': n_samples,
+            'n_recordings': len(unique_recs),
+            'has_preictal': has_preictal,
+            'recording_ids': unique_recs,
+        })
+
+    if len(subject_meta) == 0:
         empty = np.array([], dtype=np.int64)
         return empty, empty, empty
 
-    pre_recs = [row for row in rec_meta if row['has_preictal']]
-    non_recs = [row for row in rec_meta if not row['has_preictal']]
-    rng.shuffle(pre_recs)
-    rng.shuffle(non_recs)
+    # Prioritize subjects with seizures for better preictal coverage
+    seizure_subjects = [row for row in subject_meta if row['has_preictal']]
+    nonseizure_subjects = [row for row in subject_meta if not row['has_preictal']]
+    rng.shuffle(seizure_subjects)
+    rng.shuffle(nonseizure_subjects)
 
-    # Place preictal-containing recordings first to increase chance each split
-    # receives seizure context, then fill with non-seizure recordings.
-    ordered_recs = pre_recs + non_recs
+    ordered_subjects = seizure_subjects + nonseizure_subjects
 
     n_total = int(len(y))
     target = {
@@ -548,24 +824,21 @@ def _split_indices_by_recording_timeline(
         'test': max(0.0, (1.0 - float(train_ratio) - float(val_ratio)) * n_total),
     }
     assigned = {'train': 0, 'val': 0, 'test': 0}
-    split_recs = {'train': [], 'val': [], 'test': []}
-    rec_size = {row['rec_id']: int(row['n']) for row in rec_meta}
+    split_subjects = {'train': [], 'val': [], 'test': []}
 
-    for row in ordered_recs:
-        # Greedy assignment by smallest target-fill ratio.
+    for row in ordered_subjects:
+        # Greedy assignment by smallest target-fill ratio
         best_split = min(
             ['train', 'val', 'test'],
             key=lambda name: assigned[name] / max(target[name], 1.0)
         )
-        split_recs[best_split].append(row['rec_id'])
-        assigned[best_split] += int(row['n'])
+        split_subjects[best_split].append(row['subj_id'])
+        assigned[best_split] += int(row['n_samples'])
 
-    # For small-N recording scenarios, avoid empty splits when feasible.
-    # If we have >=3 recordings total, try to keep at least one recording in
-    # each split by moving one recording from the currently largest donor split.
-    if len(unique_recs) >= 3:
+    # Ensure no split is empty (for small numbers of subjects)
+    if len(unique_subjects) >= 3:
         for need_split in ['train', 'val', 'test']:
-            if len(split_recs[need_split]) > 0:
+            if len(split_subjects[need_split]) > 0:
                 continue
 
             donor = None
@@ -573,7 +846,7 @@ def _split_indices_by_recording_timeline(
             for candidate in ['train', 'val', 'test']:
                 if candidate == need_split:
                     continue
-                if len(split_recs[candidate]) <= 1:
+                if len(split_subjects[candidate]) <= 1:
                     continue
                 if assigned[candidate] > donor_size:
                     donor = candidate
@@ -582,23 +855,38 @@ def _split_indices_by_recording_timeline(
             if donor is None:
                 continue
 
-            # Move the smallest recording from donor to minimize disturbance.
-            donor_rec = min(split_recs[donor], key=lambda rec_id: rec_size.get(rec_id, 0))
-            split_recs[donor].remove(donor_rec)
-            split_recs[need_split].append(donor_rec)
-            moved_n = rec_size.get(donor_rec, 0)
+            # Move the smallest subject from donor to minimize disturbance
+            donor_subj = min(split_subjects[donor], key=lambda subj_id: next((row['n_samples'] for row in subject_meta if row['subj_id'] == subj_id), 0))
+            split_subjects[donor].remove(donor_subj)
+            split_subjects[need_split].append(donor_subj)
+            moved_n = next((row['n_samples'] for row in subject_meta if row['subj_id'] == donor_subj), 0)
             assigned[donor] -= moved_n
             assigned[need_split] += moved_n
 
     def _collect(split_name: str) -> np.ndarray:
-        recs = split_recs[split_name]
-        if len(recs) == 0:
+        subjects = split_subjects[split_name]
+        if len(subjects) == 0:
             return np.array([], dtype=np.int64)
-        mask = np.isin(recording_ids, np.asarray(recs))
-        idx = np.where(mask)[0]
+
+        # Collect all indices for subjects in this split
+        split_indices = []
+        for subj_id in subjects:
+            subj_mask = subject_ids == subj_id
+            subj_indices = np.where(subj_mask)[0]
+            split_indices.extend(subj_indices)
+
+        idx = np.array(split_indices, dtype=np.int64)
+        # Sort by recording and time within each recording for sequential processing
         return _sort_indices_by_timeline(idx, recording_ids, sample_end_times_s)
 
-    return _collect('train'), _collect('val'), _collect('test')
+    train_idx = _collect('train')
+    val_idx = _collect('val')
+    test_idx = _collect('test')
+
+    logger.info(f"Patient-sequential split: {len(split_subjects['train'])} train subjects, {len(split_subjects['val'])} val subjects, {len(split_subjects['test'])} test subjects")
+    logger.info(f"Sample counts: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+
+    return train_idx, val_idx, test_idx
 
 
 def _select_panel_indices(true_countdown: np.ndarray,
@@ -791,26 +1079,102 @@ def _augment_train_dataset(X_train: np.ndarray, y_train: np.ndarray,
     return X_augmented, y_augmented
 
 
+def _configure_long_sweep_online_augmentation(train_dataset, config: Config, args):
+    """Enable memory-light augmentation for long-sweep training datasets."""
+    if not getattr(args, 'long_sweep_training', False):
+        return train_dataset
+    if not bool(getattr(config.data, 'augment_preictal', True)):
+        logger.info("Long-sweep mode: preictal augmentation disabled (augment_preictal=false)")
+        return train_dataset
+    if not bool(getattr(config.data, 'online_preictal_augmentation', True)):
+        logger.info("Long-sweep mode: online preictal augmentation disabled by config")
+        return train_dataset
+
+    prob = float(np.clip(getattr(config.data, 'online_preictal_augmentation_prob', 0.7), 0.0, 1.0))
+    if prob <= 0.0:
+        logger.info("Long-sweep mode: online preictal augmentation probability is 0.0")
+        return train_dataset
+
+    if hasattr(train_dataset, 'enable_online_preictal_augmentation'):
+        train_dataset.enable_online_preictal_augmentation(
+            config.data,
+            seed=int(config.data.random_seed),
+            probability=prob,
+            preictal_only=True,
+        )
+        logger.info(
+            "Long-sweep mode: enabled online preictal augmentation (prob=%.2f) without expanding dataset in memory",
+            prob,
+        )
+    else:
+        logger.warning("Long-sweep mode: train dataset does not support online augmentation")
+    return train_dataset
+
+
+def _ensure_nonempty_splits(
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    long_sweep_training: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Ensure val/test splits are non-empty to keep evaluation stable."""
+    train_idx = np.asarray(train_idx, dtype=np.int64)
+    val_idx = np.asarray(val_idx, dtype=np.int64)
+    test_idx = np.asarray(test_idx, dtype=np.int64)
+
+    def _take_tail(src: np.ndarray, count: int) -> Tuple[np.ndarray, np.ndarray]:
+        count = int(min(max(count, 0), len(src)))
+        if count <= 0:
+            return src, np.array([], dtype=np.int64)
+        return src[:-count], src[-count:]
+
+    if len(val_idx) == 0 and len(train_idx) > 1:
+        n_move = max(1, len(train_idx) // 10)
+        train_idx, moved = _take_tail(train_idx, n_move)
+        val_idx = moved
+        logger.warning("Split fix: val split was empty; moved %d samples from train to val", len(moved))
+
+    if len(test_idx) == 0:
+        if len(val_idx) > 1:
+            n_move = max(1, len(val_idx) // 10)
+            val_idx, moved = _take_tail(val_idx, n_move)
+            test_idx = moved
+            logger.warning("Split fix: test split was empty; moved %d samples from val to test", len(moved))
+        elif len(train_idx) > 1:
+            n_move = max(1, len(train_idx) // 10)
+            train_idx, moved = _take_tail(train_idx, n_move)
+            test_idx = moved
+            logger.warning("Split fix: test split was empty; moved %d samples from train to test", len(moved))
+
+    # Keep chronological order in long-sweep mode.
+    if long_sweep_training:
+        train_idx = np.sort(train_idx)
+        val_idx = np.sort(val_idx)
+        test_idx = np.sort(test_idx)
+
+    return train_idx, val_idx, test_idx
+
+
 def _prepare_real_datasets(config: Config, args, loader: BIDSDataLoader, recordings: List[dict]):
-    """Build datasets from real ECG(+EEG/motion) recordings and seizure onsets.
+    """Build lazy streaming datasets from real BIDS ECG recordings.
 
-    When a multimodal model is requested (see ModelFactory.is_multimodal), this
-    routine will attempt to construct per-window feature matrices that contain
-    concatenated ECG, EEG, and motion proxies in the following layout along the
-    feature dimension:
+    Instead of pre-computing and storing feature tensors (which would require
+    ~500 GB for the full ds005873 dataset at 1 s stride), this function:
 
-        [0 : ecg_feature_dim)        → ECG-derived channels
-        [ecg : ecg+eeg)              → EEG-derived channels (if available)
-        [ecg+eeg : ecg+eeg+motion)   → Motion-derived channels (currently zero
-                                       placeholders unless motion data is
-                                       wired in later).
+      1. Extracts/caches the raw ECG signal for each recording as a compact
+         float32 binary file (~68 MB per recording, 22 GB total for 325 recs).
+      2. Computes only window indices and labels – no feature matrices.
+      3. Returns LazyRealDataset instances that compute features on-the-fly
+         in __getitem__ via memory-mapped binary files.
 
-    For single-modal models, only ECG-derived channels are constructed.
+    Raw signal binary files are stored in {dataset_root}/.ecg_signal_cache/
+    (co-located with the EDF files on the large data disk so the home
+    partition is not filled).
     """
-    logger.info("Preparing REAL dataset from SeizeIT2 ECG(+EEG) + events...")
+    logger.info("Preparing REAL dataset (lazy streaming) from SeizeIT2 ECG + events...")
     prep_start = time.time()
 
-    recordings = _select_recordings_for_real_mode(recordings, args.max_recordings)
+    recordings = _select_recordings_for_real_mode(recordings, args.max_recordings, loader)
     seizure_recordings = sum(1 for recording in recordings if int(recording.get('num_seizures', 0)) > 0)
     logger.info(
         "Selected %d recordings for real mode (%d with seizures)",
@@ -822,275 +1186,221 @@ def _prepare_real_datasets(config: Config, args, loader: BIDSDataLoader, recordi
     is_multimodal = _MF.is_multimodal(config.model.model_type)
 
     ecg_dim = int(config.model.ecg_feature_dim)
-    eeg_dim = int(config.model.eeg_feature_dim) if is_multimodal else 0
-    motion_dim = int(config.model.motion_feature_dim) if is_multimodal else 0
+    # For now lazy streaming only supports ECG-only models; multimodal can be
+    # extended later by adding EEG/motion binary caches.
+    feature_dim = ecg_dim
 
-    if is_multimodal:
-        logger.info(
-            "REAL mode: constructing multimodal features with dims (ECG=%d, EEG=%d, motion=%d)",
-            ecg_dim,
-            eeg_dim,
-            motion_dim,
-        )
-    else:
-        logger.info("REAL mode: constructing ECG-only features with dim=%d", ecg_dim)
+    logger.info("REAL mode (lazy): ECG feature dim=%d", feature_dim)
 
     sequence_seconds = 120.0
     stride_seconds = float(config.data.feature_step_s)
     preictal_window_s = float(config.data.pre_ictal_window_s)
 
-    all_features = []
-    all_labels = []
-    all_sample_end_times_s = []
-    all_recording_ids = []
-    low_density_warning_emitted = False
+    # Raw signal cache on the same disk as the dataset (avoids filling /home)
+    dataset_root = Path(config.data.dataset_root)
+    signal_cache_dir = dataset_root / ".ecg_signal_cache"
+    signal_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Metadata collected per window (all lightweight)
+    all_rec_indices: List[int] = []
+    all_end_indices: List[int] = []
+    all_labels_list: List[float] = []
+    all_times_list: List[float] = []
+    all_rec_ids: List[str] = []
+    recordings_meta: List[dict] = []  # one entry per accepted recording
+
+    total_samples = 0
 
     for rec_idx, recording in enumerate(recordings):
         try:
             rec_start = time.time()
-            if rec_idx < 5 or (rec_idx + 1) % 5 == 0:
+            if rec_idx < 5 or (rec_idx + 1) % 10 == 0:
                 logger.info(
-                    "[REAL PREP] Processing recording %d/%d: sub-%s ses-%s run-%s",
+                    "[REAL PREP] Recording %d/%d: sub-%s ses-%s run-%s",
                     rec_idx + 1,
                     len(recordings),
-                    recording.get('subject_id', '?'),
-                    recording.get('session_id', '?'),
-                    recording.get('run_id', '?'),
+                    recording.get("subject_id", "?"),
+                    recording.get("session_id", "?"),
+                    recording.get("run_id", "?"),
                 )
 
-            ecg_data, fs = loader.load_subject_edf(
-                recording['subject_id'],
-                recording['session_id'],
-                'ecg',
-                recording['run_id']
-            )
-            signal_1d = ecg_data[0] if ecg_data.ndim > 1 else ecg_data
-
-            # Optionally load EEG and motion streams when training multimodal
-            # models. If alignment or loading fails, fall back to zero-filled
-            # channels so that the architecture remains consistent while still
-            # benefiting from ECG.
-            eeg_1d = None
-            fs_eeg = None
-            if is_multimodal and eeg_dim > 0:
-                try:
-                    eeg_data, fs_eeg = loader.load_subject_edf(
-                        recording['subject_id'],
-                        recording['session_id'],
-                        'eeg',
-                        recording['run_id'],
-                    )
-                    eeg_1d = eeg_data[0] if eeg_data.ndim > 1 else eeg_data
-
-                    if not np.isfinite(fs_eeg) or abs(float(fs_eeg) - float(fs)) > 1e-3:
-                        logger.warning(
-                            "Skipping EEG for sub-%s ses-%s run-%s due to sampling-rate mismatch (ECG=%.3f Hz, EEG=%.3f Hz)",
-                            recording.get('subject_id', '?'),
-                            recording.get('session_id', '?'),
-                            recording.get('run_id', '?'),
-                            float(fs),
-                            float(fs_eeg),
-                        )
-                        eeg_1d = None
-                except Exception as eeg_error:
-                    logger.warning(
-                        "Could not load EEG for sub-%s ses-%s run-%s: %s",
-                        recording.get('subject_id', '?'),
-                        recording.get('session_id', '?'),
-                        recording.get('run_id', '?'),
-                        str(eeg_error),
-                    )
-
-            events_df = loader.load_events_tsv(
-                recording['subject_id'],
-                recording['session_id'],
-                recording['run_id']
-            )
-            seizure_onsets = _extract_seizure_onsets(events_df)
+            # --- ensure raw signal binary is cached on disk --------------------
+            try:
+                bin_path, fs, n_samples = _ensure_raw_signal_cache(
+                    recording, loader, signal_cache_dir
+                )
+            except FileNotFoundError as exc:
+                logger.warning("Skipping sub-%s run-%s: %s", recording.get("subject_id"), recording.get("run_id"), exc)
+                continue
 
             seq_samples = int(sequence_seconds * fs)
             stride_samples = max(1, int(stride_seconds * fs))
 
-            candidate_end_indices = np.arange(seq_samples, len(signal_1d), stride_samples, dtype=np.int64)
+            # --- seizure onsets -----------------------------------------------
+            events_df = loader.load_events_tsv(
+                recording["subject_id"],
+                recording["session_id"],
+                recording["run_id"],
+            )
+            seizure_onsets = _extract_seizure_onsets(events_df)
+
+            # --- generate window end-indices -----------------------------------
+            candidate_end_indices = np.arange(
+                seq_samples, n_samples, stride_samples, dtype=np.int64
+            )
             if len(candidate_end_indices) == 0:
                 continue
 
-            # Long-sweep mode keeps all chronological windows to mimic true
-            # day-long streaming operation.
-            if (not args.long_sweep_training) and args.max_samples_per_recording > 0 and len(candidate_end_indices) > args.max_samples_per_recording:
-                selected_positions = np.linspace(
+            # Long-sweep / patient-sequential: keep all chronological windows
+            if (
+                not (args.long_sweep_training or args.patient_sequential)
+                and args.max_samples_per_recording > 0
+                and len(candidate_end_indices) > args.max_samples_per_recording
+            ):
+                pos = np.linspace(
                     0,
                     len(candidate_end_indices) - 1,
                     num=args.max_samples_per_recording,
                     dtype=np.int64,
                 )
-                selected_end_indices = candidate_end_indices[selected_positions]
+                selected_end_indices = candidate_end_indices[pos]
             else:
                 selected_end_indices = candidate_end_indices
 
-            if (not low_density_warning_emitted) and len(selected_end_indices) > 1:
-                covered_seconds = float(selected_end_indices[-1] - selected_end_indices[0]) / float(fs)
-                effective_hz = float(len(selected_end_indices) - 1) / max(covered_seconds, 1e-6)
-                if effective_hz < 0.2:
-                    logger.warning(
-                        "Low temporal sampling detected for visualization (effective %.3f Hz over %.1f min). "
-                        "This can make 60-minute panels appear sparse. "
-                        "Current --max-samples-per-recording=%d; consider MAX_SAMPLES_PER_RECORDING=0 "
-                        "or a much larger value.",
-                        effective_hz,
-                        covered_seconds / 60.0,
-                        int(args.max_samples_per_recording),
-                    )
-                    low_density_warning_emitted = True
+            # --- vectorised label computation ----------------------------------
+            end_times = selected_end_indices.astype(np.float64) / fs
+            if len(seizure_onsets) > 0:
+                dt = seizure_onsets.astype(np.float64)[None, :] - end_times[:, None]  # (N, K)
+                dt[dt < 0] = np.inf
+                min_dt = dt.min(axis=1)
+                labels_arr = np.where(min_dt <= preictal_window_s, min_dt / 60.0, -1.0).astype(np.float32)
+            else:
+                labels_arr = np.full(len(selected_end_indices), -1.0, dtype=np.float32)
 
-            sample_count_for_recording = 0
-            recording_uid = f"sub-{recording['subject_id']}_ses-{recording['session_id']}_run-{recording['run_id']}"
-            for end_idx in selected_end_indices:
-                # ECG window
-                if end_idx <= seq_samples:
-                    continue
-                segment = signal_1d[end_idx - seq_samples:end_idx]
+            # --- register recording and append window metadata -----------------
+            meta_idx = len(recordings_meta)
+            recording_uid = (
+                f"sub-{recording['subject_id']}"
+                f"_ses-{recording['session_id']}"
+                f"_run-{recording['run_id']}"
+            )
+            recordings_meta.append({
+                "signal_path": str(bin_path),
+                "fs": float(fs),
+                "seq_samples": seq_samples,
+                "n_samples": n_samples,
+                "recording_uid": recording_uid,
+            })
 
-                # Always construct ECG-derived channels.
-                ecg_features = _segment_to_feature_matrix(segment, ecg_dim, target_steps=600)
+            n_windows = len(selected_end_indices)
+            all_rec_indices.extend([meta_idx] * n_windows)
+            all_end_indices.extend(selected_end_indices.tolist())
+            all_labels_list.extend(labels_arr.tolist())
+            all_times_list.extend(end_times.tolist())
+            all_rec_ids.extend([recording_uid] * n_windows)
+            total_samples += n_windows
 
-                # EEG window (if available); otherwise, zeros.
-                if is_multimodal and eeg_dim > 0 and eeg_1d is not None and len(eeg_1d) >= end_idx:
-                    eeg_segment = eeg_1d[end_idx - seq_samples:end_idx]
-                    eeg_features = _segment_to_feature_matrix(eeg_segment, eeg_dim, target_steps=600)
-                elif is_multimodal and eeg_dim > 0:
-                    eeg_features = np.zeros((600, eeg_dim), dtype=np.float32)
-                else:
-                    eeg_features = None
-
-                # Motion window: currently a zero placeholder that preserves
-                # architecture compatibility. This can be replaced with true
-                # motion-derived features once motion streams are wired in.
-                if is_multimodal and motion_dim > 0:
-                    motion_segment = np.zeros_like(segment, dtype=np.float32)
-                    motion_features = _segment_to_feature_matrix(motion_segment, motion_dim, target_steps=600)
-                else:
-                    motion_features = None
-
-                if is_multimodal:
-                    feature_blocks = [ecg_features]
-                    if eeg_features is not None:
-                        feature_blocks.append(eeg_features)
-                    if motion_features is not None:
-                        feature_blocks.append(motion_features)
-                    feature_mat = np.concatenate(feature_blocks, axis=-1)
-                else:
-                    feature_mat = ecg_features
-
-                t_end = end_idx / fs
-                future_onsets = seizure_onsets[seizure_onsets >= t_end]
-                if len(future_onsets) > 0:
-                    dt = float(future_onsets[0] - t_end)
-                    countdown_label = dt / 60.0 if dt <= preictal_window_s else -1.0
-                else:
-                    countdown_label = -1.0
-
-                all_features.append(feature_mat)
-                all_labels.append(countdown_label)
-                all_sample_end_times_s.append(float(t_end))
-                all_recording_ids.append(recording_uid)
-                sample_count_for_recording += 1
-
-            elapsed = time.time() - prep_start
-            avg_per_recording = elapsed / max(1, rec_idx + 1)
-            remaining = max(0, len(recordings) - (rec_idx + 1))
-            eta_seconds = avg_per_recording * remaining
-            if rec_idx < 5 or (rec_idx + 1) % 5 == 0:
+            if rec_idx < 5 or (rec_idx + 1) % 10 == 0:
+                elapsed = time.time() - prep_start
+                avg = elapsed / max(1, rec_idx + 1)
+                eta = avg * max(0, len(recordings) - rec_idx - 1)
                 logger.info(
-                    "[REAL PREP] Done %d/%d | +%d samples (total=%d) | rec_time=%.1fs | ETA=%.1f min",
-                    rec_idx + 1,
-                    len(recordings),
-                    sample_count_for_recording,
-                    len(all_labels),
+                    "[REAL PREP] Done %d/%d | +%d windows (total=%d) | rec_time=%.1fs | ETA=%.1f min",
+                    rec_idx + 1, len(recordings),
+                    n_windows, total_samples,
                     time.time() - rec_start,
-                    eta_seconds / 60.0,
+                    eta / 60.0,
                 )
 
         except Exception as error:
-            logger.debug(f"Skipping recording due to load/process issue: {error}")
+            import traceback as _tb
+            logger.debug("Skipping recording: %s\n%s", error, _tb.format_exc())
             continue
 
-    if len(all_labels) < 100:
+    if total_samples < 50:
         logger.warning("Real dataset extraction produced too few samples; falling back to dummy mode.")
         return None
 
     logger.info(
-        "[REAL PREP] Completed in %.1f min with %d samples",
+        "[REAL PREP] Completed in %.1f min with %d total windows across %d recordings",
         (time.time() - prep_start) / 60.0,
-        len(all_labels),
+        total_samples,
+        len(recordings_meta),
     )
 
-    X = np.stack(all_features).astype(np.float32)
-    y = np.array(all_labels, dtype=np.float32)
-    sample_end_times_s = np.array(all_sample_end_times_s, dtype=np.float32)
-    recording_ids = np.array(all_recording_ids)
+    # Convert to arrays
+    rec_indices_arr = np.array(all_rec_indices, dtype=np.int32)
+    end_indices_arr = np.array(all_end_indices, dtype=np.int64)
+    labels_arr = np.array(all_labels_list, dtype=np.float32)
+    times_arr = np.array(all_times_list, dtype=np.float32)
+    recording_ids = np.array(all_rec_ids)
 
-    if args.long_sweep_training:
-        train_idx, val_idx, test_idx = _split_indices_by_recording_timeline(
-            y,
+    # --- train/val/test split --------------------------------------------------
+    if args.patient_sequential:
+        train_idx, val_idx, test_idx = _split_indices_by_patient_sequential(
+            labels_arr,
             recording_ids=recording_ids,
-            sample_end_times_s=sample_end_times_s,
+            sample_end_times_s=times_arr,
+            train_ratio=config.data.train_ratio,
+            val_ratio=config.data.val_ratio,
+            seed=config.data.random_seed,
+        )
+    elif args.long_sweep_training:
+        train_idx, val_idx, test_idx = _split_indices_by_recording_timeline(
+            labels_arr,
+            recording_ids=recording_ids,
+            sample_end_times_s=times_arr,
             train_ratio=config.data.train_ratio,
             val_ratio=config.data.val_ratio,
             seed=config.data.random_seed,
         )
     else:
         train_idx, val_idx, test_idx = _split_indices_with_preictal_coverage(
-            y,
+            labels_arr,
             train_ratio=config.data.train_ratio,
             val_ratio=config.data.val_ratio,
             seed=config.data.random_seed,
         )
 
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_val, y_val = X[val_idx], y[val_idx]
-    X_test, y_test = X[test_idx], y[test_idx]
-    val_sample_end_times_s = sample_end_times_s[val_idx]
-    val_recording_ids = recording_ids[val_idx]
-    test_sample_end_times_s = sample_end_times_s[test_idx]
-    test_recording_ids = recording_ids[test_idx]
-    n_total = len(y)
-
-    # Long-sweep mode avoids augmentation to preserve real temporal dynamics.
-    if args.long_sweep_training:
-        logger.info("Long-sweep mode: disabling augmentation to preserve true timeline")
-        train_sample_end_times_s = sample_end_times_s[train_idx]
-        train_recording_ids = recording_ids[train_idx]
-    else:
-        # Apply data augmentation to training set (preictal samples only)
-        X_train, y_train = _augment_train_dataset(X_train, y_train, config)
-        train_sample_end_times_s = None
-        train_recording_ids = None
-
-    from src import SeizureDataset
-    train_dataset = SeizureDataset(
-        X_train,
-        y_train,
-        sample_end_times_s=train_sample_end_times_s,
-        recording_ids=train_recording_ids,
-    )
-    val_dataset = SeizureDataset(
-        X_val,
-        y_val,
-        sample_end_times_s=val_sample_end_times_s,
-        recording_ids=val_recording_ids,
-    )
-    test_dataset = SeizureDataset(
-        X_test,
-        y_test,
-        sample_end_times_s=test_sample_end_times_s,
-        recording_ids=test_recording_ids,
+    train_idx, val_idx, test_idx = _ensure_nonempty_splits(
+        train_idx, val_idx, test_idx,
+        long_sweep_training=bool(args.long_sweep_training or args.patient_sequential),
     )
 
-    logger.info(f"Real dataset prepared: total={n_total}, train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)}")
-    logger.info(f"Train class distribution: {train_dataset.class_distribution}")
-    logger.info(f"Val class distribution: {val_dataset.class_distribution}")
-    logger.info(f"Test class distribution: {test_dataset.class_distribution}")
+    def _make_subject_ids(idx):
+        return np.array([r.split("_")[0].replace("sub-", "") for r in recording_ids[idx]])
+
+    subject_ids_train = _make_subject_ids(train_idx) if args.patient_sequential else None
+    subject_ids_val = _make_subject_ids(val_idx) if args.patient_sequential else None
+    subject_ids_test = _make_subject_ids(test_idx) if args.patient_sequential else None
+
+    def _make_split(idx, subject_ids):
+        return LazyRealDataset(
+            rec_indices=rec_indices_arr[idx],
+            end_indices=end_indices_arr[idx],
+            labels=labels_arr[idx],
+            sample_end_times_s=times_arr[idx],
+            recording_ids=recording_ids[idx],
+            recordings_meta=recordings_meta,
+            feature_dim=feature_dim,
+            subject_ids=subject_ids,
+        )
+
+    train_dataset = _make_split(train_idx, subject_ids_train)
+    train_dataset = _configure_long_sweep_online_augmentation(train_dataset, config, args)
+    val_dataset = _make_split(val_idx, subject_ids_val)
+    test_dataset = _make_split(test_idx, subject_ids_test)
+
+    logger.info(
+        "Real dataset ready: total=%d, train=%d, val=%d, test=%d",
+        total_samples,
+        len(train_dataset),
+        len(val_dataset),
+        len(test_dataset),
+    )
+    logger.info("Train class distribution: %s", train_dataset.class_distribution)
+    logger.info("Val   class distribution: %s", val_dataset.class_distribution)
+    logger.info("Test  class distribution: %s", test_dataset.class_distribution)
 
     return train_dataset, val_dataset, test_dataset
 
@@ -1107,8 +1417,6 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
     # recordings before real-mode selection to avoid loading hundreds of
     # long interictal recordings that add little preictal coverage.
     max_nonseiz = int(getattr(config.data, "max_wearable_nonseizure_recordings", 0) or 0)
-    if args.long_sweep_training:
-        max_nonseiz = 0
     if max_nonseiz > 0:
         seizure_recs = [r for r in recordings if int(r.get('num_seizures', 0)) > 0]
         nonseizure_recs = [r for r in recordings if int(r.get('num_seizures', 0)) <= 0]
@@ -1128,7 +1436,11 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
             max_nonseiz,
         )
 
-    recordings = _select_recordings_for_real_mode(recordings, args.max_recordings)
+    # For BIDS data, validate that recordings have actual data files
+    # For wearable data, validation is done during get_all_recordings()
+    if args.data_source == 'bids':
+        recordings = _select_recordings_for_real_mode(recordings, args.max_recordings, loader)
+    
     seizure_recordings = sum(1 for recording in recordings if int(recording.get('num_seizures', 0)) > 0)
     logger.info(
         "Selected %d wearable recordings for real mode (%d with seizures)",
@@ -1323,20 +1635,24 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
                     for window in features
                 ]).astype(np.float32)
 
-            # Optional cap per recording for faster iteration. Long-sweep mode
-            # keeps full chronological coverage.
-            if (not args.long_sweep_training) and args.max_samples_per_recording > 0 and len(features) > args.max_samples_per_recording:
-                keep_positions = np.linspace(
-                    0,
-                    len(features) - 1,
-                    num=args.max_samples_per_recording,
-                    dtype=np.int64,
-                )
+            # Optional cap per recording for faster iteration.
+            # In long-sweep mode we keep the earliest contiguous windows to
+            # preserve timeline semantics and avoid random jumps.
+            if args.max_samples_per_recording > 0 and len(features) > args.max_samples_per_recording:
+                if args.long_sweep_training or args.patient_sequential:
+                    keep_positions = np.arange(args.max_samples_per_recording, dtype=np.int64)
+                else:
+                    keep_positions = np.linspace(
+                        0,
+                        len(features) - 1,
+                        num=args.max_samples_per_recording,
+                        dtype=np.int64,
+                    )
                 features = features[keep_positions]
                 labels = labels[keep_positions]
                 sample_times_s = sample_times_s[keep_positions]
 
-            if not args.long_sweep_training:
+            if not (args.long_sweep_training or args.patient_sequential):
                 # Memory-optimized seizure-context sampling: 5/10/20 minute bands.
                 keep_idx = _context_sample_indices(
                     recording,
@@ -1353,7 +1669,7 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
             # the cap, stop processing further recordings. If this
             # recording would exceed the budget, subsample within this
             # recording while trying to preserve some preictal coverage.
-            if (not args.long_sweep_training) and max_global > 0:
+            if max_global > 0:
                 remaining = max_global - total_kept
                 if remaining <= 0:
                     logger.info(
@@ -1363,23 +1679,27 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
                     break
 
                 if len(labels) > remaining:
-                    rng_local = np.random.default_rng(int(config.data.random_seed) + rec_idx)
-                    idx_all = np.arange(len(labels), dtype=np.int64)
-                    pre_idx = idx_all[labels >= 0]
-                    inter_idx = idx_all[labels < 0]
-
-                    if len(pre_idx) == 0 or remaining <= len(pre_idx):
-                        chosen_local = rng_local.choice(idx_all, size=remaining, replace=False)
+                    if args.long_sweep_training or args.patient_sequential:
+                        # Preserve strict chronology in long-sweep mode.
+                        chosen_local = np.arange(remaining, dtype=np.int64)
                     else:
-                        target_pre = min(len(pre_idx), max(1, int(0.4 * remaining)))
-                        target_inter = remaining - target_pre
-                        chosen_pre = rng_local.choice(pre_idx, size=target_pre, replace=False)
-                        if len(inter_idx) >= target_inter:
-                            chosen_inter = rng_local.choice(inter_idx, size=target_inter, replace=False)
+                        rng_local = np.random.default_rng(int(config.data.random_seed) + rec_idx)
+                        idx_all = np.arange(len(labels), dtype=np.int64)
+                        pre_idx = idx_all[labels >= 0]
+                        inter_idx = idx_all[labels < 0]
+
+                        if len(pre_idx) == 0 or remaining <= len(pre_idx):
+                            chosen_local = rng_local.choice(idx_all, size=remaining, replace=False)
                         else:
-                            chosen_inter = inter_idx
-                        chosen_local = np.concatenate([chosen_pre, chosen_inter])
-                        rng_local.shuffle(chosen_local)
+                            target_pre = min(len(pre_idx), max(1, int(0.4 * remaining)))
+                            target_inter = remaining - target_pre
+                            chosen_pre = rng_local.choice(pre_idx, size=target_pre, replace=False)
+                            if len(inter_idx) >= target_inter:
+                                chosen_inter = rng_local.choice(inter_idx, size=target_inter, replace=False)
+                            else:
+                                chosen_inter = inter_idx
+                            chosen_local = np.concatenate([chosen_pre, chosen_inter])
+                            rng_local.shuffle(chosen_local)
 
                     features = features[chosen_local]
                     labels = labels[chosen_local]
@@ -1425,35 +1745,39 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
     # class balance as much as possible via random subsampling.
     max_global = int(getattr(config.data, "max_wearable_global_samples", 0) or 0)
     n_before_cap = len(y)
-    if (not args.long_sweep_training) and max_global > 0 and n_before_cap > max_global:
+    if max_global > 0 and n_before_cap > max_global:
         logger.warning(
             "Wearable dataset has %d samples; applying global cap max_wearable_global_samples=%d",
             n_before_cap,
             max_global,
         )
-        rng = np.random.default_rng(int(config.data.random_seed))
-
-        # Stratified subsampling to keep some preictal coverage.
-        pre_idx = np.where(y >= 0)[0]
-        inter_idx = np.where(y < 0)[0]
-
-        if len(pre_idx) == 0 or max_global <= len(pre_idx):
-            # No preictal or very tiny cap: plain random subset.
-            chosen = rng.choice(n_before_cap, size=max_global, replace=False)
+        if args.long_sweep_training or args.patient_sequential:
+            # Keep earliest windows to preserve chronological training flow.
+            chosen = np.arange(max_global, dtype=np.int64)
         else:
-            # Reserve up to 20% of slots for preictal (but not exceeding
-            # available preictal samples), remainder from interictal.
-            target_pre = min(len(pre_idx), max(1, int(0.2 * max_global)))
-            target_inter = max_global - target_pre
+            rng = np.random.default_rng(int(config.data.random_seed))
 
-            chosen_pre = rng.choice(pre_idx, size=target_pre, replace=False)
-            chosen_inter = (
-                rng.choice(inter_idx, size=target_inter, replace=False)
-                if len(inter_idx) >= target_inter
-                else inter_idx
-            )
-            chosen = np.concatenate([chosen_pre, chosen_inter])
-            rng.shuffle(chosen)
+            # Stratified subsampling to keep some preictal coverage.
+            pre_idx = np.where(y >= 0)[0]
+            inter_idx = np.where(y < 0)[0]
+
+            if len(pre_idx) == 0 or max_global <= len(pre_idx):
+                # No preictal or very tiny cap: plain random subset.
+                chosen = rng.choice(n_before_cap, size=max_global, replace=False)
+            else:
+                # Reserve up to 20% of slots for preictal (but not exceeding
+                # available preictal samples), remainder from interictal.
+                target_pre = min(len(pre_idx), max(1, int(0.2 * max_global)))
+                target_inter = max_global - target_pre
+
+                chosen_pre = rng.choice(pre_idx, size=target_pre, replace=False)
+                chosen_inter = (
+                    rng.choice(inter_idx, size=target_inter, replace=False)
+                    if len(inter_idx) >= target_inter
+                    else inter_idx
+                )
+                chosen = np.concatenate([chosen_pre, chosen_inter])
+                rng.shuffle(chosen)
 
         X = X[chosen]
         y = y[chosen]
@@ -1473,7 +1797,7 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
         logger.error("Wearable dataset preparation produced zero preictal samples after alignment.")
         return None
 
-    if args.long_sweep_training:
+    if args.long_sweep_training or args.patient_sequential:
         train_idx, val_idx, test_idx = _split_indices_by_recording_timeline(
             y,
             recording_ids=recording_ids,
@@ -1490,6 +1814,13 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
             seed=config.data.random_seed,
         )
 
+    train_idx, val_idx, test_idx = _ensure_nonempty_splits(
+        train_idx,
+        val_idx,
+        test_idx,
+        long_sweep_training=bool(args.long_sweep_training or args.patient_sequential),
+    )
+
     X_train, y_train = X[train_idx], y[train_idx]
     X_val, y_val = X[val_idx], y[val_idx]
     X_test, y_test = X[test_idx], y[test_idx]
@@ -1500,8 +1831,8 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
     test_recording_ids = recording_ids[test_idx]
     n_total = len(y)
 
-    if args.long_sweep_training:
-        logger.info("Long-sweep mode: disabling augmentation to preserve true timeline")
+    if args.long_sweep_training or args.patient_sequential:
+        logger.info("Long-sweep mode: using online preictal augmentation (no offline expansion)")
         train_sample_end_times_s = sample_end_times_s[train_idx]
         train_recording_ids = recording_ids[train_idx]
     else:
@@ -1516,6 +1847,7 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
         sample_end_times_s=train_sample_end_times_s,
         recording_ids=train_recording_ids,
     )
+    train_dataset = _configure_long_sweep_online_augmentation(train_dataset, config, args)
     val_dataset = SeizureDataset(
         X_val,
         y_val,
@@ -1546,7 +1878,11 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
 
 def _real_cache_path(config: Config, args) -> Path:
     """Create deterministic cache path for real-mode dataset extraction."""
-    cache_root = Path('/tmp/epilepsee_ai_cache')
+    cache_root_override = os.environ.get('EPILEPSEE_CACHE_DIR')
+    if cache_root_override:
+        cache_root = Path(cache_root_override).expanduser()
+    else:
+        cache_root = Path(config.training.save_dir).expanduser() / 'cache' / 'datasets'
     cache_root.mkdir(parents=True, exist_ok=True)
 
     key_payload = {
@@ -1560,7 +1896,8 @@ def _real_cache_path(config: Config, args) -> Path:
         'wearable_signal_version': 3,
         'max_recordings': int(args.max_recordings),
         'max_samples_per_recording': int(args.max_samples_per_recording),
-        'window_sampling_strategy_version': 5,
+        # Bump when long-sweep split/cap/augmentation semantics change.
+        'window_sampling_strategy_version': 7,  # lazy streaming format
         'feature_step_s': float(config.data.feature_step_s),
         'pre_ictal_window_s': float(config.data.pre_ictal_window_s),
         'seed': int(config.data.random_seed),
@@ -1575,60 +1912,117 @@ def _real_cache_path(config: Config, args) -> Path:
 
 
 def _save_real_dataset_cache(cache_path: Path, train_dataset, val_dataset, test_dataset) -> None:
-    """Persist prepared datasets to NPZ cache."""
+    """Persist LazyRealDataset metadata to a compact NPZ cache.
+
+    For LazyRealDataset the cache stores only window indices + labels
+    (kilobytes per recording, not gigabytes).  For legacy SeizureDataset the
+    original full-features NPZ format is preserved.
+    """
     tmp_path = cache_path.with_suffix('.tmp.npz')
-    np.savez_compressed(
-        tmp_path,
-        train_features=train_dataset.features,
-        train_labels=train_dataset.labels,
-        val_features=val_dataset.features,
-        val_labels=val_dataset.labels,
-        val_sample_end_times_s=(np.array([], dtype=np.float32) if getattr(val_dataset, 'sample_end_times_s', None) is None else val_dataset.sample_end_times_s),
-        val_recording_ids=(np.array([], dtype='<U1') if getattr(val_dataset, 'recording_ids', None) is None else np.asarray(val_dataset.recording_ids)),
-        test_features=test_dataset.features,
-        test_labels=test_dataset.labels,
-        test_sample_end_times_s=(np.array([], dtype=np.float32) if getattr(test_dataset, 'sample_end_times_s', None) is None else test_dataset.sample_end_times_s),
-        test_recording_ids=(np.array([], dtype='<U1') if getattr(test_dataset, 'recording_ids', None) is None else np.asarray(test_dataset.recording_ids)),
-    )
+
+    def _s(ds, key):
+        v = getattr(ds, key, None)
+        return np.array([], dtype=np.float32) if v is None else np.asarray(v)
+
+    if isinstance(train_dataset, LazyRealDataset):
+        np.savez_compressed(
+            tmp_path,
+            # schema tag
+            lazy_format=np.array([1], dtype=np.int8),
+            # recordings metadata (JSON-encoded)
+            recordings_json=np.array([json.dumps(train_dataset.recordings_meta)]),
+            feature_dim=np.array([train_dataset.feature_dim], dtype=np.int32),
+            # train
+            train_rec_indices=train_dataset.rec_indices,
+            train_end_indices=train_dataset.end_indices,
+            train_labels=train_dataset.labels,
+            train_times=train_dataset.sample_end_times_s,
+            train_rec_ids=train_dataset.recording_ids,
+            train_subject_ids=(np.array([], dtype='<U1') if train_dataset.subject_ids is None else np.asarray(train_dataset.subject_ids)),
+            # val
+            val_rec_indices=val_dataset.rec_indices,
+            val_end_indices=val_dataset.end_indices,
+            val_labels=val_dataset.labels,
+            val_times=val_dataset.sample_end_times_s,
+            val_rec_ids=val_dataset.recording_ids,
+            val_subject_ids=(np.array([], dtype='<U1') if val_dataset.subject_ids is None else np.asarray(val_dataset.subject_ids)),
+            # test
+            test_rec_indices=test_dataset.rec_indices,
+            test_end_indices=test_dataset.end_indices,
+            test_labels=test_dataset.labels,
+            test_times=test_dataset.sample_end_times_s,
+            test_rec_ids=test_dataset.recording_ids,
+            test_subject_ids=(np.array([], dtype='<U1') if test_dataset.subject_ids is None else np.asarray(test_dataset.subject_ids)),
+        )
+    else:
+        np.savez_compressed(
+            tmp_path,
+            train_features=train_dataset.features,
+            train_labels=train_dataset.labels,
+            val_features=val_dataset.features,
+            val_labels=val_dataset.labels,
+            val_sample_end_times_s=_s(val_dataset, 'sample_end_times_s'),
+            val_recording_ids=(np.array([], dtype='<U1') if getattr(val_dataset, 'recording_ids', None) is None else np.asarray(val_dataset.recording_ids)),
+            test_features=test_dataset.features,
+            test_labels=test_dataset.labels,
+            test_sample_end_times_s=_s(test_dataset, 'sample_end_times_s'),
+            test_recording_ids=(np.array([], dtype='<U1') if getattr(test_dataset, 'recording_ids', None) is None else np.asarray(test_dataset.recording_ids)),
+        )
     os.replace(tmp_path, cache_path)
 
 
 def _load_real_dataset_cache(cache_path: Path):
-    """Load cached real datasets."""
+    """Load cached real datasets (supports both lazy-metadata and legacy full-features formats)."""
+    data = np.load(cache_path, allow_pickle=False)
+
+    if 'lazy_format' in data:
+        # --- lazy metadata format -------------------------------------------
+        recordings_meta = json.loads(str(data['recordings_json'][0]))
+        feature_dim = int(data['feature_dim'][0])
+
+        def _opt_arr(key):
+            v = data[key] if key in data else None
+            return None if (v is None or len(v) == 0) else v
+
+        def _make(prefix):
+            subj = _opt_arr(f'{prefix}_subject_ids')
+            return LazyRealDataset(
+                rec_indices=data[f'{prefix}_rec_indices'],
+                end_indices=data[f'{prefix}_end_indices'],
+                labels=data[f'{prefix}_labels'],
+                sample_end_times_s=data[f'{prefix}_times'],
+                recording_ids=data[f'{prefix}_rec_ids'],
+                recordings_meta=recordings_meta,
+                feature_dim=feature_dim,
+                subject_ids=subj,
+            )
+
+        return _make('train'), _make('val'), _make('test')
+
+    # --- legacy full-features format ----------------------------------------
     from src import SeizureDataset
 
-    # Use memory-mapped loading so multiple DDP ranks can share the
-    # same underlying arrays without duplicating them in host RAM.
-    data = np.load(cache_path, mmap_mode="r")
+    def _opt(key):
+        v = data[key] if key in data else None
+        return None if (v is None or len(v) == 0) else v
+
     train_dataset = SeizureDataset(data['train_features'], data['train_labels'])
-
-    val_sample_end_times_s = data['val_sample_end_times_s'] if 'val_sample_end_times_s' in data else None
-    val_recording_ids = data['val_recording_ids'] if 'val_recording_ids' in data else None
-    if val_sample_end_times_s is not None and len(val_sample_end_times_s) == 0:
-        val_sample_end_times_s = None
-    if val_recording_ids is not None and len(val_recording_ids) == 0:
-        val_recording_ids = None
-
-    test_sample_end_times_s = data['test_sample_end_times_s'] if 'test_sample_end_times_s' in data else None
-    test_recording_ids = data['test_recording_ids'] if 'test_recording_ids' in data else None
-    if test_sample_end_times_s is not None and len(test_sample_end_times_s) == 0:
-        test_sample_end_times_s = None
-    if test_recording_ids is not None and len(test_recording_ids) == 0:
-        test_recording_ids = None
-
     val_dataset = SeizureDataset(
-        data['val_features'],
-        data['val_labels'],
-        sample_end_times_s=val_sample_end_times_s,
-        recording_ids=val_recording_ids,
+        data['val_features'], data['val_labels'],
+        sample_end_times_s=_opt('val_sample_end_times_s'),
+        recording_ids=_opt('val_recording_ids'),
     )
     test_dataset = SeizureDataset(
-        data['test_features'],
-        data['test_labels'],
-        sample_end_times_s=test_sample_end_times_s,
-        recording_ids=test_recording_ids,
+        data['test_features'], data['test_labels'],
+        sample_end_times_s=_opt('test_sample_end_times_s'),
+        recording_ids=_opt('test_recording_ids'),
     )
     return train_dataset, val_dataset, test_dataset
+
+
+def _cleanup_temp_real_memmaps(*datasets) -> None:
+    """No-op: LazyRealDataset uses no temporary memmaps."""
+    pass
 
 
 def prepare_datasets(config: Config, args):
@@ -1680,7 +2074,9 @@ def prepare_datasets(config: Config, args):
 
         if cache_path.exists():
             logger.info(f"Loading real dataset from cache: {cache_path}")
-            return _load_real_dataset_cache(cache_path)
+            train_dataset, val_dataset, test_dataset = _load_real_dataset_cache(cache_path)
+            train_dataset = _configure_long_sweep_online_augmentation(train_dataset, config, args)
+            return train_dataset, val_dataset, test_dataset
 
         if world_size == 1 or rank == 0:
             if args.data_source == 'wearable':
@@ -1690,7 +2086,9 @@ def prepare_datasets(config: Config, args):
             if prepared is not None:
                 _save_real_dataset_cache(cache_path, *prepared)
                 logger.info(f"Saved real dataset cache: {cache_path}")
-                return prepared
+                _cleanup_temp_real_memmaps(*prepared)
+                logger.info(f"Loading real dataset from cache after save: {cache_path}")
+                return _load_real_dataset_cache(cache_path)
             if args.strict_real_data:
                 raise RuntimeError(
                     f"Real {args.data_source} dataset preparation failed to produce a usable train/val/test split."
@@ -1793,15 +2191,13 @@ def main():
     config.training.learning_rate = args.learning_rate
     if args.real_stride_seconds is not None:
         config.data.feature_step_s = float(args.real_stride_seconds)
-    if args.long_sweep_training:
+    if args.patient_sequential:
         config.training.long_sweep_training = True
         config.training.use_weighted_sampling = False
-        config.data.augment_preictal = False
-        if args.max_samples_per_recording > 0:
-            logger.info(
-                "Long-sweep mode enabled: ignoring --max-samples-per-recording=%d to preserve full timeline",
-                int(args.max_samples_per_recording),
-            )
+    if args.augment_preictal is not None:
+        config.data.augment_preictal = bool(args.augment_preictal)
+    if args.online_aug_prob is not None:
+        config.data.online_preictal_augmentation_prob = float(np.clip(args.online_aug_prob, 0.0, 1.0))
     if args.dataset_root:
         config.data.dataset_root = args.dataset_root
     elif args.data_source == 'wearable' and 'ds005873' in str(config.data.dataset_root):
@@ -1817,7 +2213,20 @@ def main():
         logger.info("Auto-set wearable dataset_root to %s", config.data.dataset_root)
     # Propagate data_source into config for downstream components
     config.data.data_source = args.data_source
-    
+
+    # ── Loss type ─────────────────────────────────────────────────────────────
+    # --state-loss: safe 3-class classification, no countdown regression.
+    # Stores the choice in config.loss so Trainer.train() picks it up.
+    if getattr(args, 'state_loss', False):
+        config.loss.loss_type = 'state'
+        config.loss.onset_threshold_min = float(getattr(args, 'onset_threshold_min', 2.0))
+        logger.info(
+            "Loss mode: SeizureStateLoss (3-class, no GT countdown regression). "
+            "Onset window: %.1f min.", config.loss.onset_threshold_min
+        )
+    else:
+        config.loss.loss_type = 'countdown'
+
     # Device
     if args.no_cuda or not torch.cuda.is_available():
         device = torch.device('cpu')
@@ -1838,7 +2247,28 @@ def main():
     
     # Prepare datasets
     train_dataset, val_dataset, test_dataset = prepare_datasets(config, args)
-    
+
+    # ── Ring buffer ───────────────────────────────────────────────────────────
+    # Wrap train_dataset in a TemporalRingBufferDataset so only the most recent
+    # N samples are visible per epoch, evicting older data as training advances.
+    ring_buffer_size = int(getattr(args, 'ring_buffer_size', 0))
+    if ring_buffer_size > 0 and len(train_dataset) > ring_buffer_size:
+        from src.data_loader import TemporalRingBufferDataset
+        train_dataset = TemporalRingBufferDataset(
+            train_dataset, ring_buffer_size=ring_buffer_size
+        )
+        logger.info(
+            "Ring-buffer training enabled: window=%d samples out of %d total. "
+            "Window advances ~10%% per epoch.",
+            ring_buffer_size,
+            len(train_dataset._dataset),
+        )
+    elif ring_buffer_size > 0:
+        logger.info(
+            "Ring-buffer size %d >= dataset size %d — windowing disabled.",
+            ring_buffer_size, len(train_dataset),
+        )
+
     # Create trainer
     trainer = Trainer(config, device=device)
     
@@ -1876,7 +2306,7 @@ def main():
     bayes_sweep_payload = None
     test_times = getattr(test_dataset, 'sample_end_times_s', None)
     test_rec_ids = getattr(test_dataset, 'recording_ids', None)
-    if args.long_sweep_training and test_times is not None and test_rec_ids is not None:
+    if (args.long_sweep_training or args.patient_sequential) and test_times is not None and test_rec_ids is not None:
         try:
             bayes_sweep_payload = evaluator.simulate_bayesian_long_sweep(
                 pred_preictal=prediction_payload['pred_preictal'],
@@ -1976,7 +2406,18 @@ def main():
     # Use waveform-like signal proxy aligned with per-window predictions.
     # For wearable runs, treat feature channel 0 as the PPG-derived
     # heart-rate series; for BIDS runs, choose the most dynamic channel.
-    features_arr = np.asarray(test_dataset.features, dtype=np.float32)
+    if isinstance(test_dataset, LazyRealDataset):
+        # Lazy dataset: materialise only what the visualiser needs by computing
+        # features for the first 2000 test windows (enough for a representative
+        # panel) without loading all windows into RAM.
+        n_vis = min(len(test_dataset), 2000)
+        _vis_feats = np.stack([
+            test_dataset[i][0].numpy() for i in range(n_vis)
+        ])
+        features_arr = _vis_feats
+        logger.info("LazyRealDataset: materialised %d/%d test windows for visualisation", n_vis, len(test_dataset))
+    else:
+        features_arr = np.asarray(test_dataset.features, dtype=np.float32)
     mid_idx = features_arr.shape[1] // 2
 
     data_source = getattr(config.data, "data_source", "bids")

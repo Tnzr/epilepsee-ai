@@ -328,7 +328,7 @@ def main() -> None:
     top_tokens = top_tokens[: max(1, int(args.max_hist_tokens))]
 
     fig = plt.figure(figsize=(18, 13))
-    gs = GridSpec(4, 1, figure=fig, hspace=0.35)
+    gs = GridSpec(5, 1, figure=fig, hspace=0.35)
 
     # 1) Token timeline + preictal traces
     ax1 = fig.add_subplot(gs[0])
@@ -365,8 +365,32 @@ def main() -> None:
     cbar3 = plt.colorbar(im3, ax=ax3, fraction=0.018, pad=0.01)
     cbar3.set_label("Rolling token occupancy")
 
-    # 4) Rolling embedding/channel heatmap waterfall
-    ax4 = fig.add_subplot(gs[3])
+    # 4) Token correlation matrix
+    ax_corr = fig.add_subplot(gs[3])
+    # Compute correlation between token time series
+    if token_rolling.shape[1] > 1:
+        corr_matrix = np.corrcoef(token_rolling.T)
+        im_corr = ax_corr.imshow(
+            corr_matrix,
+            aspect="equal",
+            origin="upper",
+            interpolation="nearest",
+            cmap="coolwarm",
+            vmin=-1, vmax=1,
+        )
+        ax_corr.set_xticks(np.arange(token_count))
+        ax_corr.set_yticks(np.arange(token_count))
+        ax_corr.set_xticklabels([str(i) for i in range(token_count)], fontsize=6)
+        ax_corr.set_yticklabels([str(i) for i in range(token_count)], fontsize=6)
+        ax_corr.set_title("Token Activation Correlation Matrix")
+        cbar_corr = plt.colorbar(im_corr, ax=ax_corr, fraction=0.046, pad=0.04)
+        cbar_corr.set_label("Correlation")
+    else:
+        ax_corr.text(0.5, 0.5, "Not enough tokens for correlation", ha="center", va="center", transform=ax_corr.transAxes)
+        ax_corr.set_title("Token Correlation Matrix (insufficient data)")
+
+    # 5) Rolling embedding/channel heatmap waterfall
+    ax4 = fig.add_subplot(gs[4])
     im4 = ax4.imshow(
         emb_roll_norm,
         aspect="auto",

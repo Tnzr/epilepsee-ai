@@ -323,6 +323,7 @@ class SignalVisualizer:
                                    ppg_signal: Optional[np.ndarray] = None,
                                    eda_signal: Optional[np.ndarray] = None,
                                    eeg_signal: Optional[np.ndarray] = None,
+                                   adxl_series: Optional[np.ndarray] = None,
                                    pred_preictal_smooth: Optional[np.ndarray] = None,
                                    train_cm_true_preictal: Optional[np.ndarray] = None,
                                    train_cm_pred_preictal_prob: Optional[np.ndarray] = None,
@@ -334,12 +335,21 @@ class SignalVisualizer:
                                    title_prefix: str = '',
                                    footer_text: str = '',
                                    signal_label: str = 'ECG proxy',
+                                   eeg_signal_label: str = 'EEG proxy',
+                                   pred_onset_prob: Optional[np.ndarray] = None,
+                                   pred_preictal_only_prob: Optional[np.ndarray] = None,
+                                   gt_onset: Optional[np.ndarray] = None,
+                                   gt_preictal_only: Optional[np.ndarray] = None,
+                                   visualization_mode: str = 'countdown',
                                    figsize: Tuple[int, int] = (12, 9)) -> plt.Figure:
-        """Create panel with multimodal traces, dual-axis HR/HRV, and inference.
+        """Create panel with multimodal traces, ADXL+HRV, optional EEG subplot, and inference.
 
-        When *eeg_signal* is provided, it is plotted alongside the ECG proxy in
-        the top-left panel so that paired modality behavior can be inspected for
-        the same timeline.
+        Layout (left column):
+          Row 0: PPG + EDA overlay
+          Row 1: ADXL (motion) + HRV dual axis
+          Row 2: EEG (only when eeg_signal is provided)
+          Row -2: Smoothed alarm + countdown references
+          Row -1: Inference heatmap
         """
         n_samples = len(true_countdown)
         if time_axis_minutes is not None:
@@ -347,113 +357,111 @@ class SignalVisualizer:
         else:
             x_minutes = np.arange(n_samples) / sampling_rate / 60.0
         gt_preictal = (true_countdown >= 0).astype(int)
+        gt_onset = np.asarray(gt_onset, dtype=np.int32) if gt_onset is not None and len(gt_onset) == n_samples else np.zeros(n_samples, dtype=np.int32)
+        gt_preictal_only = np.asarray(gt_preictal_only, dtype=np.int32) if gt_preictal_only is not None and len(gt_preictal_only) == n_samples else np.maximum(gt_preictal - gt_onset, 0)
+        pred_onset_prob = np.asarray(pred_onset_prob, dtype=np.float32) if pred_onset_prob is not None and len(pred_onset_prob) == n_samples else None
+        pred_preictal_only_prob = np.asarray(pred_preictal_only_prob, dtype=np.float32) if pred_preictal_only_prob is not None and len(pred_preictal_only_prob) == n_samples else None
+        state_mode = str(visualization_mode).lower() == 'state' and pred_onset_prob is not None and pred_preictal_only_prob is not None
         pred_binary = (pred_preictal_prob >= detection_threshold).astype(int)
 
-        fig = plt.figure(figsize=figsize, constrained_layout=True)
-        panel_title = 'GT vs Inference Panel (PPG/EDA/EEG + HR/HRV + Countdown + Inference)'
+        has_eeg = eeg_signal is not None and len(eeg_signal) == n_samples
+        n_left_rows = 5 if has_eeg else 4
+        fig_h = figsize[1] + (2 if has_eeg else 0)
+
+        fig = plt.figure(figsize=(figsize[0], fig_h), constrained_layout=True)
+        panel_title = 'GT vs Inference Panel (PPG/EDA | ADXL/HRV | EEG | Alarm | Heatmap)'
         if title_prefix:
             panel_title = f'{title_prefix} | {panel_title}'
-        fig.suptitle(
-            panel_title,
-            fontsize=11,
-            fontweight='bold'
-        )
-        grid = GridSpec(4, 2, figure=fig, width_ratios=[3.0, 1.35], hspace=0.18, wspace=0.15)
+        fig.suptitle(panel_title, fontsize=11, fontweight='bold')
+        grid = GridSpec(n_left_rows, 2, figure=fig, width_ratios=[3.0, 1.35], hspace=0.18, wspace=0.15)
 
-        # Left-1: primary signal with optional EDA/EEG overlays
-        # Normalize signals independently so overlays are visible despite different scales
+        # Row indices — shift alarm/heatmap down by 1 when EEG subplot is present
+        row_adxl   = 1
+        row_eeg    = 2 if has_eeg else None
+        row_alarm  = 3 if has_eeg else 2
+        row_heat   = 4 if has_eeg else 3
+
+        # ── Left-1: PPG + EDA overlay ──────────────────────────────────────────
         ax_signal = fig.add_subplot(grid[0, 0])
-        
+
         def _normalize_signal(sig: np.ndarray) -> np.ndarray:
-            """Normalize signal to [0, 1] for overlay visibility."""
             sig = np.asarray(sig, dtype=np.float32)
-            sig_min = float(np.nanmin(sig))
-            sig_max = float(np.nanmax(sig))
-            if np.isnan(sig_min) or np.isnan(sig_max) or sig_max <= sig_min:
+            s_min, s_max = float(np.nanmin(sig)), float(np.nanmax(sig))
+            if np.isnan(s_min) or np.isnan(s_max) or s_max <= s_min:
                 return np.zeros_like(sig, dtype=np.float32)
-            return (sig - sig_min) / (sig_max - sig_min + 1e-8)
-        
-        # Plot primary signal (PPG > ECG)
+            return (sig - s_min) / (s_max - s_min + 1e-8)
+
         primary_signal = ppg_signal if ppg_signal is not None and len(ppg_signal) == len(ecg_signal) else ecg_signal
-        primary_norm = _normalize_signal(primary_signal)
-        ax_signal.plot(x_minutes, primary_norm, color='black', linewidth=1.2, alpha=0.85, 
-                      label=f'{signal_label} (normalized)')
-        
-        # Plot EDA overlay if available
+        ax_signal.plot(x_minutes, _normalize_signal(primary_signal), color='black',
+                       linewidth=1.2, alpha=0.85, label=f'{signal_label} (norm)')
+
         if eda_signal is not None and len(eda_signal) == len(primary_signal):
-            eda_norm = _normalize_signal(eda_signal)
-            ax_signal.plot(x_minutes, eda_norm, color='seagreen', linewidth=1.0, alpha=0.75, 
-                          label='EDA proxy (normalized)')
-        
-        # Plot EEG on secondary Y-axis if available to preserve scale independence
-        if eeg_signal is not None and len(eeg_signal) == len(ecg_signal):
-            ax_eeg = ax_signal.twinx()
-            eeg_norm = _normalize_signal(eeg_signal)
-            ax_eeg.plot(x_minutes, eeg_norm, color='purple', linewidth=1.0, alpha=0.7, 
-                       label='EEG proxy (normalized)')
-            ax_eeg.set_ylabel('EEG (normalized)', color='purple', fontsize=9)
-            ax_eeg.tick_params(axis='y', labelcolor='purple')
-            
-            # Combine legends
-            lines1, labels1 = ax_signal.get_legend_handles_labels()
-            lines2, labels2 = ax_eeg.get_legend_handles_labels()
-            ax_signal.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
-        else:
-            ax_signal.legend(loc='upper right', fontsize=8)
-        
+            ax_signal.plot(x_minutes, _normalize_signal(eda_signal), color='seagreen',
+                           linewidth=1.0, alpha=0.75, label='EDA proxy (norm)')
+
         y_min, y_max = 0.0, 1.0
         ax_signal.fill_between(x_minutes, y_min, y_max, where=gt_preictal > 0,
                                color='green', alpha=0.12, label='GT preictal')
         ax_signal.fill_between(x_minutes, y_min, y_max, where=pred_binary > 0,
                                color='orange', alpha=0.10, label='Predicted preictal')
-        ax_signal.set_title('PPG/EDA/EEG proxies with GT / predicted preictal regions', fontweight='bold', fontsize=10)
+        ax_signal.set_title('PPG / EDA with GT + predicted preictal regions', fontweight='bold', fontsize=10)
         ax_signal.set_ylabel('Signal (normalized)', fontsize=9)
         ax_signal.set_ylim(y_min, y_max)
         ax_signal.grid(True, alpha=0.25)
+        ax_signal.legend(loc='upper right', fontsize=8)
 
-        # Left-2: HR + HRV on dual axes with improved scaling
-        ax_hr = fig.add_subplot(grid[1, 0], sharex=ax_signal)
-        
-        # Ensure HR/HRV have proper ranges for visualization
-        hr_clean = np.asarray(hr_series, dtype=np.float32)
+        # ── Left-2: ADXL (motion) + HRV dual axis ──────────────────────────────
+        ax_adxl = fig.add_subplot(grid[row_adxl, 0], sharex=ax_signal)
         hrv_clean = np.asarray(hrv_series, dtype=np.float32)
-        
-        # For wearable data with small HR values, scale if needed
-        hr_range = float(np.nanmax(hr_clean)) - float(np.nanmin(hr_clean))
-        if hr_range < 5.0 and hr_range > 0:  # Very small range, likely raw PPG values
-            # Rescale to physiological HR range (60-120 bpm nominal)
-            hr_scaled = 60.0 + (hr_clean - float(np.nanmin(hr_clean))) / (hr_range + 1e-8) * 60.0
-            hr_label = 'HR (rescaled, bpm)'
+
+        if adxl_series is not None and len(adxl_series) == n_samples:
+            adxl_clean = np.asarray(adxl_series, dtype=np.float32)
+            adxl_range = float(np.nanmax(adxl_clean)) - float(np.nanmin(adxl_clean))
+            adxl_label = 'ADXL motion (raw)' 
+            ax_adxl.plot(x_minutes, adxl_clean, color='darkorange',
+                         linewidth=1.3, alpha=0.9, label=adxl_label)
+            ax_adxl.set_ylabel('ADXL (raw)', color='darkorange', fontsize=9)
+            ax_adxl.tick_params(axis='y', labelcolor='darkorange')
         else:
-            hr_scaled = hr_clean
-            hr_label = 'HR (native, bpm)'
-        
-        ax_hr.plot(x_minutes, hr_scaled, color='royalblue', linewidth=1.5, alpha=0.95, label=hr_label)
-        ax_hr.set_ylabel(hr_label, color='royalblue', fontsize=9)
-        ax_hr.tick_params(axis='y', labelcolor='royalblue')
-        ax_hr.grid(True, alpha=0.25)
-        
-        # HRV on secondary axis with independent scaling
-        ax_hrv2 = ax_hr.twinx()
+            ax_adxl.set_ylabel('ADXL (no data)', fontsize=9)
+
+        ax_adxl.grid(True, alpha=0.25)
+
+        ax_hrv2 = ax_adxl.twinx()
         hrv_range = float(np.nanmax(hrv_clean)) - float(np.nanmin(hrv_clean))
-        if hrv_range < 5.0 and hrv_range > 0:  # Small range PPG std
+        if hrv_range < 5.0 and hrv_range > 0:
             hrv_scaled = 10.0 + (hrv_clean - float(np.nanmin(hrv_clean))) / (hrv_range + 1e-8) * 50.0
             hrv_label = 'HRV (rescaled, ms)'
         else:
             hrv_scaled = hrv_clean
             hrv_label = 'HRV (native, ms)'
-        
         ax_hrv2.plot(x_minutes, hrv_scaled, color='teal', linewidth=1.3, alpha=0.85, label=hrv_label)
         ax_hrv2.set_ylabel(hrv_label, color='teal', fontsize=9)
         ax_hrv2.tick_params(axis='y', labelcolor='teal')
-        ax_hr.set_title('Estimated HR + HRV (dual axis, wearable adaptive scaling)', fontweight='bold', fontsize=10)
+        ax_adxl.set_title('ADXL motion + HRV (dual axis)', fontweight='bold', fontsize=10)
 
-        hr_lines, hr_labels = ax_hr.get_legend_handles_labels()
-        hrv_lines, hrv_labels = ax_hrv2.get_legend_handles_labels()
-        ax_hr.legend(hr_lines + hrv_lines, hr_labels + hrv_labels, loc='upper right', fontsize=8)
+        adxl_lines, adxl_lbls = ax_adxl.get_legend_handles_labels()
+        hrv_lines, hrv_lbls = ax_hrv2.get_legend_handles_labels()
+        ax_adxl.legend(adxl_lines + hrv_lines, adxl_lbls + hrv_lbls, loc='upper right', fontsize=8)
 
-        # Left-3: smoothed alarm + countdown references
-        ax_smooth = fig.add_subplot(grid[2, 0], sharex=ax_signal)
+        # ── Left-EEG (optional): dedicated EEG subplot ─────────────────────────
+        ax_eeg_plot = None
+        if has_eeg:
+            ax_eeg_plot = fig.add_subplot(grid[row_eeg, 0], sharex=ax_signal)
+            eeg_norm = _normalize_signal(eeg_signal)
+            ax_eeg_plot.plot(x_minutes, eeg_norm, color='purple', linewidth=1.0, alpha=0.85,
+                             label=f'{eeg_signal_label} (norm)')
+            ax_eeg_plot.fill_between(x_minutes, 0.0, 1.0, where=gt_preictal > 0,
+                                     color='green', alpha=0.08)
+            ax_eeg_plot.set_title(eeg_signal_label, fontweight='bold', fontsize=10)
+            ax_eeg_plot.set_ylabel('EEG (norm)', color='purple', fontsize=9)
+            ax_eeg_plot.tick_params(axis='y', labelcolor='purple')
+            ax_eeg_plot.set_ylim(0.0, 1.0)
+            ax_eeg_plot.grid(True, alpha=0.25)
+            ax_eeg_plot.legend(loc='upper right', fontsize=8)
+
+        # ── Left-alarm: smoothed alarm + countdown references ───────────────────
+        ax_smooth = fig.add_subplot(grid[row_alarm, 0], sharex=ax_signal)
         has_smooth = pred_preictal_smooth is not None and len(pred_preictal_smooth) == len(pred_preictal_prob)
         if has_smooth:
             ax_smooth.plot(
@@ -478,68 +486,68 @@ class SignalVisualizer:
         ax_smooth.fill_between(x_minutes, 0.0, 1.0, where=gt_preictal > 0,
                                color='green', alpha=0.08, label='GT preictal window')
 
-        # Countdown references: show continuous time-to-seizure across entire window.
-        # This helps the model learn to predict not just "preictal vs interictal" but
-        # actual minutes to seizure, enabling gradually declining predictions as
-        # seizure approaches.
-        
-        gt_countdown_ref = np.full_like(true_countdown, 100.0, dtype=np.float32)
-        gt_preictal_mask = true_countdown >= 0
-        
-        if np.any(gt_preictal_mask):
-            # For preictal samples, use true countdown values (0 = at seizure onset)
-            gt_countdown_ref[gt_preictal_mask] = true_countdown[gt_preictal_mask]
-            
-            # For interictal samples, estimate time to next seizure by finding
-            # the distance to the nearest preictal sample
-            interictal_mask = ~gt_preictal_mask
-            if np.any(interictal_mask):
-                preictal_indices = np.where(gt_preictal_mask)[0]
-                interictal_indices = np.where(interictal_mask)[0]
-                
-                for idx in interictal_indices:
-                    # Find distance to nearest preictal sample
-                    distances = np.abs(preictal_indices - idx)
-                    nearest_preictal_idx = preictal_indices[np.argmin(distances)]
-                    
-                    # Time to seizure = distance to seizure onset (where countdown=0)
-                    # Search for the minimum countdown value (closest to 0) in preictal region
-                    preictal_countdowns = true_countdown[gt_preictal_mask]
-                    min_countdown_val = np.min(preictal_countdowns)
-                    nearest_preictal_countdown = true_countdown[nearest_preictal_idx]
-                    
-                    # Extrapolate: if we're far from preictal window, estimate large countdown
-                    # Use a defensive estimate based on window distance
-                    distance_in_samples = int(np.abs(idx - nearest_preictal_idx))
-                    estimated_countdown = nearest_preictal_countdown + distance_in_samples * sampling_rate / 60.0
-                    gt_countdown_ref[idx] = float(np.clip(estimated_countdown, 0.5, 200.0))
-        
-        # Normalize countdown references to [0,1] for visualization overlay with alarm prob
-        max_countdown = float(np.max(gt_countdown_ref))
-        if max_countdown > 0:
-            gt_countdown_ref_norm = np.clip(gt_countdown_ref / max(max_countdown, 10.0), 0.0, 1.0)
+        if state_mode:
+            ax_smooth.plot(
+                x_minutes,
+                np.clip(pred_preictal_only_prob, 0.0, 1.0),
+                color='royalblue',
+                linewidth=1.5,
+                alpha=0.90,
+                linestyle='-',
+                label='Preictal prob',
+            )
+            ax_smooth.plot(
+                x_minutes,
+                np.clip(pred_onset_prob, 0.0, 1.0),
+                color='crimson',
+                linewidth=1.6,
+                alpha=0.90,
+                linestyle=':',
+                label='Onset prob',
+            )
+            ax_smooth.fill_between(x_minutes, 0.0, 1.0, where=gt_preictal_only > 0,
+                                   color='cornflowerblue', alpha=0.10, label='GT preictal-only')
+            ax_smooth.fill_between(x_minutes, 0.0, 1.0, where=gt_onset > 0,
+                                   color='crimson', alpha=0.10, label='GT onset')
+            ax_smooth.set_title('State probabilities', fontweight='bold', fontsize=10)
         else:
-            gt_countdown_ref_norm = np.zeros_like(gt_countdown_ref, dtype=np.float32)
-        
-        pred_countdown_ref = np.clip(pred_countdown.astype(np.float32) / max(10.0, np.max(np.abs(pred_countdown)) + 1e-6), 0.0, 1.0)
-        ax_smooth.plot(
-            x_minutes,
-            gt_countdown_ref_norm,
-            color='forestgreen',
-            linewidth=1.8,
-            alpha=0.9,
-            linestyle='-',
-            label='GT countdown ref (continuous)',
-        )
-        ax_smooth.plot(
-            x_minutes,
-            pred_countdown_ref,
-            color='crimson',
-            linewidth=1.6,
-            alpha=0.85,
-            linestyle=':',
-            label='Pred countdown ref',
-        )
+            positive_gt = true_countdown[true_countdown >= 0]
+            observed_gt_max = float(np.max(positive_gt)) if positive_gt.size > 0 else 0.0
+            if observed_gt_max <= 1.5:
+                countdown_ref_max = 1.0
+            else:
+                countdown_ref_max = max(30.0, observed_gt_max)
+
+            gt_countdown_ref = np.full_like(true_countdown, 1.0, dtype=np.float32)
+            gt_preictal_mask = true_countdown >= 0
+            if np.any(gt_preictal_mask):
+                preictal_max = 10.0
+                gt_countdown_ref[gt_preictal_mask] = true_countdown[gt_preictal_mask] / preictal_max
+            if countdown_ref_max > 0:
+                gt_countdown_ref_norm = np.clip(gt_countdown_ref / countdown_ref_max, 0.0, 1.0)
+            else:
+                gt_countdown_ref_norm = np.zeros_like(gt_countdown_ref, dtype=np.float32)
+
+            pred_scale = max(countdown_ref_max, float(np.max(np.abs(pred_countdown))) + 1e-6)
+            pred_countdown_ref = np.clip(pred_countdown.astype(np.float32) / pred_scale, 0.0, 1.0)
+            ax_smooth.plot(
+                x_minutes,
+                gt_countdown_ref_norm,
+                color='forestgreen',
+                linewidth=1.8,
+                alpha=0.9,
+                linestyle='-',
+                label='GT countdown ref (continuous)',
+            )
+            ax_smooth.plot(
+                x_minutes,
+                pred_countdown_ref,
+                color='crimson',
+                linewidth=1.6,
+                alpha=0.85,
+                linestyle=':',
+                label='Pred countdown ref',
+            )
 
         if np.any(gt_preictal > 0):
             preictal_indices = np.where(gt_preictal > 0)[0]
@@ -551,30 +559,43 @@ class SignalVisualizer:
             ax_smooth.axvline(x=onset_x, color='purple', linestyle='--', linewidth=1.6,
                               label='GT seizure onset')
             ax_signal.axvline(x=onset_x, color='purple', linestyle='--', linewidth=1.0, alpha=0.9)
-            ax_hr.axvline(x=onset_x, color='purple', linestyle='--', linewidth=1.0, alpha=0.9)
-            ax_hrv2.axvline(x=onset_x, color='purple', linestyle='--', linewidth=1.0, alpha=0.9)
+            ax_adxl.axvline(x=onset_x, color='purple', linestyle='--', linewidth=1.0, alpha=0.9)
+            if ax_eeg_plot is not None:
+                ax_eeg_plot.axvline(x=onset_x, color='purple', linestyle='--', linewidth=1.0, alpha=0.9)
 
         ax_smooth.set_ylim(0.0, 1.0)
         ax_smooth.set_ylabel('Alarm prob')
-        ax_smooth.set_title('Smoothed alarm + countdown references', fontweight='bold', fontsize=10)
+        if not state_mode:
+            ax_smooth.set_title('Smoothed alarm + countdown references', fontweight='bold', fontsize=10)
         ax_smooth.grid(True, alpha=0.25)
         ax_smooth.legend(loc='upper right', fontsize=7)
 
-        # Left-4: compact heatmap (GT processed + raw + countdown)
-        ax_heat = fig.add_subplot(grid[3, 0], sharex=ax_signal)
+        # ── Left-heat: inference heatmap ────────────────────────────────────────
+        ax_heat = fig.add_subplot(grid[row_heat, 0], sharex=ax_signal)
 
-        # Build heatmap rows: continuous GT countdown (normalized) / raw prob / pred countdown
-        pred_countdown_norm = np.clip(pred_countdown / max(10.0, np.max(np.abs(pred_countdown)) + 1e-6), 0.0, 1.0)
-        gt_proximity = gt_countdown_ref_norm
-
-        heatmap_rows = [
-            gt_proximity,
-            np.clip(pred_preictal_prob, 0.0, 1.0),
-            pred_countdown_norm,
-        ]
-        ytick_labels = ['GT Countdown (cont)', 'Raw Prob', 'Pred Countdown']
-        ytick_pos    = [0.5, 1.5, 2.5]
-        n_rows = 3
+        if state_mode:
+            heatmap_rows = [
+                gt_preictal.astype(np.float32),
+                gt_preictal_only.astype(np.float32),
+                gt_onset.astype(np.float32),
+                np.clip(pred_preictal_prob, 0.0, 1.0),
+                np.clip(pred_preictal_only_prob, 0.0, 1.0),
+                np.clip(pred_onset_prob, 0.0, 1.0),
+            ]
+            ytick_labels = ['GT Active', 'GT Preictal', 'GT Onset', 'Alert Prob', 'Preictal Prob', 'Onset Prob']
+            ytick_pos = [0.5 + idx for idx in range(len(heatmap_rows))]
+            n_rows = len(heatmap_rows)
+        else:
+            pred_countdown_norm = np.clip(pred_countdown / pred_scale, 0.0, 1.0)
+            gt_proximity = gt_countdown_ref_norm
+            heatmap_rows = [
+                gt_proximity,
+                np.clip(pred_preictal_prob, 0.0, 1.0),
+                pred_countdown_norm,
+            ]
+            ytick_labels = ['GT Countdown (cont)', 'Raw Prob', 'Pred Countdown']
+            ytick_pos    = [0.5, 1.5, 2.5]
+            n_rows = 3
 
         heatmap = np.vstack(heatmap_rows)
         im = ax_heat.imshow(
@@ -591,7 +612,10 @@ class SignalVisualizer:
         ax_heat.set_yticklabels(ytick_labels, fontsize=8)
 
         ax_heat.set_xlabel('Time (minutes)')
-        ax_heat.set_title('Inference heatmap (GT processed + raw + countdown)', fontweight='bold', fontsize=10)
+        if state_mode:
+            ax_heat.set_title('State-mode inference heatmap', fontweight='bold', fontsize=10)
+        else:
+            ax_heat.set_title('Inference heatmap (GT processed + raw + countdown)', fontweight='bold', fontsize=10)
         fig.colorbar(im, ax=ax_heat, fraction=0.035, pad=0.01)
 
         # Right column: train + validation confusion matrices for epoch views,

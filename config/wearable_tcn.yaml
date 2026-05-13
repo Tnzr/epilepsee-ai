@@ -56,7 +56,8 @@ loss:
   focal_gamma: 2.0
 
   use_class_weighting: true
-  classification_positive_weight: 5.0
+  classification_positive_weight: 141.0
+  max_positive_weight: 200.0
 
 training:
   optimizer: "adam"
@@ -74,6 +75,9 @@ training:
   # For wearable runs we rely on focal loss + temporal weighting
   # rather than a WeightedRandomSampler.
   use_weighted_sampling: false
+
+  # Prefer patient-2 recordings in epoch media panels when metadata is available.
+  epoch_panel_preferred_recording: "S2"
 
   early_stopping: true
   early_stopping_patience: 15

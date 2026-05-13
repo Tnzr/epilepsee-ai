@@ -68,7 +68,7 @@ class SeizureCountdownLoss(nn.Module):
         self.weight_tau = config.weight_tau
         self.use_class_weighting = getattr(config, 'use_class_weighting', False)
         self.classification_positive_weight = getattr(config, 'classification_positive_weight', None)
-        self.max_positive_weight = 10.0
+        self.max_positive_weight = float(getattr(config, 'max_positive_weight', 200.0))
     
     def forward(self, pre_ictal_pred: torch.Tensor, countdown_pred: torch.Tensor,
                 pre_ictal_true: torch.Tensor, countdown_true: torch.Tensor,
@@ -263,19 +263,149 @@ class FocalLoss(nn.Module):
         return focal_loss.mean()
 
 
+class SeizureStateLoss(nn.Module):
+    """
+    Safe 3-state classification loss: interictal / pre-ictal / onset.
+
+    GT countdown is used *only* to bucket each sample into one of three
+    mutually exclusive states.  No regression of the countdown value is
+    performed, so the model learns WHAT state is present (healthy, warning,
+    alarm) rather than HOW MANY minutes remain until a seizure.  This
+    avoids encoding future-seizure timing in the network weights.
+
+    Model output interpretation:
+        pre_ictal_pred  → P(state ∈ {pre-ictal, onset})   [binary head]
+        countdown_pred  → P(state == onset | state is active) [onset head,
+                          sigmoid applied internally; NOT regressed]
+
+    State derivation from GT countdown ``c``  (c = minutes remaining until seizure):
+
+        Temporal order (clock time →):
+            interictal  →  pre-ictal  →  onset  →  seizure
+
+        Label order (c value ↓ as seizure approaches):
+            c <  0                     → interictal  (no upcoming seizure)
+            c >= onset_threshold_min   → pre-ictal   (seizure trajectory begun)
+            0 <= c < onset_threshold_min → onset     (imminent; last θ minutes)
+
+        NOTE: Reading the conditions in *numerical* order (−1, 0..θ, θ+) gives the
+        misleading sequence interictal → onset → pre-ictal.  The correct temporal
+        sequence is interictal → pre-ictal → onset, because c *decreases* toward 0
+        as the seizure approaches.
+
+    Loss terms:
+        L_alert  = focal BCE(pre_ictal_pred,  is_active)   [active = preictal or onset]
+        L_onset  = focal BCE(countdown_pred,  is_onset)    [within active samples only]
+        L_total  = alert_weight * L_alert + onset_weight * L_onset
+    """
+
+    def __init__(
+        self,
+        config: LossConfig,
+        onset_threshold_min: float = 2.0,
+        alert_weight: float = 1.0,
+        onset_weight: float = 1.0,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+    ):
+        super().__init__()
+        self.onset_threshold_min = float(onset_threshold_min)
+        total_w = float(alert_weight) + float(onset_weight) + 1e-9
+        self.alert_weight = float(alert_weight) / total_w
+        self.onset_weight = float(onset_weight) / total_w
+
+        # Read overrides from config if present
+        self.onset_threshold_min = float(
+            getattr(config, 'onset_threshold_min', onset_threshold_min)
+        )
+        self.alert_weight = float(getattr(config, 'alert_weight', alert_weight))
+        self.onset_weight = float(getattr(config, 'onset_weight', onset_weight))
+        total_w = self.alert_weight + self.onset_weight + 1e-9
+        self.alert_weight /= total_w
+        self.onset_weight /= total_w
+
+        self.focal_alert = FocalLoss(
+            alpha=float(getattr(config, 'focal_alpha', focal_alpha)),
+            gamma=float(getattr(config, 'focal_gamma', focal_gamma)),
+        )
+        # Onset focal uses a higher alpha because onset samples are even rarer
+        self.focal_onset = FocalLoss(
+            alpha=float(getattr(config, 'focal_alpha', 0.35)),
+            gamma=float(getattr(config, 'focal_gamma', focal_gamma)),
+        )
+
+    def forward(
+        self,
+        pre_ictal_pred: torch.Tensor,
+        countdown_pred: torch.Tensor,
+        pre_ictal_true: torch.Tensor,   # unused — derived from countdown_true
+        countdown_true: torch.Tensor,
+        sample_weights: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute safe 3-state classification loss.
+
+        Args:
+            pre_ictal_pred:  (B,) sigmoid probability for alert state [0,1]
+            countdown_pred:  (B,) value used as sigmoid onset probability [any]
+            pre_ictal_true:  (B,) ignored — derived from countdown_true
+            countdown_true:  (B,) GT countdown label; <0 = interictal, ≥0 = preictal/onset
+            sample_weights:  (B,) per-sample importance weights
+
+        Returns:
+            Dict with keys: 'total', 'alert', 'onset', 'regression'(=0), 'ranking'(=0)
+        """
+        eps = 1e-6
+
+        # ── Derive state labels (no future information encoded in loss) ──────
+        # is_active: any form of pre-ictal (includes onset)
+        is_active = (countdown_true >= 0.0).float()
+        # is_onset: the *onset window* — last onset_threshold_min before seizure
+        is_onset = (
+            (countdown_true >= 0.0) & (countdown_true < self.onset_threshold_min)
+        ).float()
+
+        # ── Alert head: P(pre-ictal OR onset) ────────────────────────────────
+        alert_prob = torch.clamp(pre_ictal_pred, eps, 1.0 - eps)
+        loss_alert = self.focal_alert(alert_prob, is_active)
+
+        # ── Onset head: P(onset | ANY) — sigmoid over countdown_pred ─────────
+        # We train this on ALL samples: interictal → onset=0,
+        # pre-ictal → onset=0, onset → onset=1.
+        # The countdown value itself is NEVER regressed.
+        onset_prob = torch.sigmoid(countdown_pred)
+        onset_prob = torch.clamp(onset_prob, eps, 1.0 - eps)
+        loss_onset = self.focal_onset(onset_prob, is_onset)
+
+        total = self.alert_weight * loss_alert + self.onset_weight * loss_onset
+
+        zero = torch.zeros(1, device=countdown_pred.device, dtype=countdown_pred.dtype).squeeze()
+        return {
+            'total': total,
+            'classification': loss_alert,
+            'alert': loss_alert,
+            'onset': loss_onset,
+            'regression': zero,
+            'ranking': zero,
+        }
+
+
 class LossFactory:
     """Factory for creating loss functions."""
-    
+
     @staticmethod
-    def create_loss(config: LossConfig) -> nn.Module:
-        """Create loss function based on config.
-        
+    def create_loss(config: LossConfig, loss_type: str = 'countdown') -> nn.Module:
+        """Create loss function based on config and loss_type.
+
         Args:
             config: LossConfig
-        
+            loss_type: 'countdown' (default, legacy regression) or
+                       'state' (safe 3-class classification, no GT countdown regression)
+
         Returns:
             Instantiated loss module
         """
+        if loss_type == 'state':
+            return SeizureStateLoss(config)
         return SeizureCountdownLoss(config)
 
 

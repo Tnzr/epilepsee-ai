@@ -114,6 +114,135 @@ def _select_detection_threshold(
     return best_threshold
 
 
+def _compute_binary_metrics(true_labels: np.ndarray,
+                            pred_probs: np.ndarray,
+                            threshold: float) -> Dict[str, float]:
+    """Compute thresholded binary classification metrics."""
+    true_arr = np.asarray(true_labels, dtype=np.int32)
+    prob_arr = np.asarray(pred_probs, dtype=np.float32)
+
+    if true_arr.size == 0 or prob_arr.size == 0:
+        return {
+            'balanced_accuracy': 0.0,
+            'sensitivity': 0.0,
+            'specificity': 0.0,
+            'precision': 0.0,
+            'f1': 0.0,
+            'tp': 0.0,
+            'tn': 0.0,
+            'fp': 0.0,
+            'fn': 0.0,
+        }
+
+    pred_arr = (prob_arr >= float(threshold)).astype(np.int32)
+    tp = int(np.sum((true_arr == 1) & (pred_arr == 1)))
+    tn = int(np.sum((true_arr == 0) & (pred_arr == 0)))
+    fp = int(np.sum((true_arr == 0) & (pred_arr == 1)))
+    fn = int(np.sum((true_arr == 1) & (pred_arr == 0)))
+
+    sensitivity = tp / max(1, tp + fn)
+    specificity = tn / max(1, tn + fp)
+    precision = tp / max(1, tp + fp)
+    f1 = 2.0 * precision * sensitivity / max(precision + sensitivity, 1e-8)
+
+    return {
+        'balanced_accuracy': 0.5 * (sensitivity + specificity),
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'precision': precision,
+        'f1': f1,
+        'tp': float(tp),
+        'tn': float(tn),
+        'fp': float(fp),
+        'fn': float(fn),
+    }
+
+
+def _derive_state_targets(true_countdown: np.ndarray,
+                          onset_threshold_min: float) -> np.ndarray:
+    """Map countdown labels to 3 states: interictal / preictal / onset."""
+    true_cd = np.asarray(true_countdown, dtype=np.float32)
+    state = np.zeros_like(true_cd, dtype=np.int32)
+    active_mask = true_cd >= 0.0
+    onset_mask = active_mask & (true_cd < float(onset_threshold_min))
+    preictal_mask = active_mask & ~onset_mask
+    state[preictal_mask] = 1
+    state[onset_mask] = 2
+    return state
+
+
+def _derive_state_probabilities(alert_prob: np.ndarray,
+                                onset_logits: np.ndarray) -> Dict[str, np.ndarray]:
+    """Derive joint state probabilities from alert and onset heads."""
+    alert_arr = np.clip(np.asarray(alert_prob, dtype=np.float32), 0.0, 1.0)
+    onset_prob = 1.0 / (1.0 + np.exp(-np.asarray(onset_logits, dtype=np.float32)))
+    onset_prob = np.clip(onset_prob, 0.0, 1.0)
+
+    onset_joint = np.clip(alert_arr * onset_prob, 0.0, 1.0)
+    preictal_only = np.clip(alert_arr * (1.0 - onset_prob), 0.0, 1.0)
+    interictal = np.clip(1.0 - alert_arr, 0.0, 1.0)
+
+    stacked = np.stack([interictal, preictal_only, onset_joint], axis=1)
+    pred_state = np.argmax(stacked, axis=1).astype(np.int32)
+    return {
+        'alert_prob': alert_arr,
+        'onset_prob': onset_prob,
+        'preictal_only_prob': preictal_only,
+        'onset_joint_prob': onset_joint,
+        'interictal_prob': interictal,
+        'pred_state': pred_state,
+    }
+
+
+def _compute_multiclass_balanced_accuracy(true_labels: np.ndarray,
+                                          pred_labels: np.ndarray,
+                                          n_classes: int) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Return macro recall, confusion matrix, and per-class recall."""
+    true_arr = np.asarray(true_labels, dtype=np.int32)
+    pred_arr = np.asarray(pred_labels, dtype=np.int32)
+    cm = np.zeros((n_classes, n_classes), dtype=np.int64)
+    for true_value, pred_value in zip(true_arr, pred_arr):
+        if 0 <= true_value < n_classes and 0 <= pred_value < n_classes:
+            cm[true_value, pred_value] += 1
+
+    row_sums = cm.sum(axis=1)
+    recalls = np.divide(
+        np.diag(cm).astype(np.float64),
+        np.maximum(row_sums, 1),
+        out=np.zeros(n_classes, dtype=np.float64),
+        where=np.maximum(row_sums, 1) > 0,
+    )
+    return float(np.mean(recalls)), cm, recalls
+
+
+def _build_confusion_matrix_figure(cm: np.ndarray,
+                                   class_labels: Tuple[str, ...],
+                                   title: str):
+    """Create a compact confusion matrix figure for wandb logging."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(5.2, 4.6))
+    im = ax.imshow(cm, cmap='Blues')
+
+    for row_idx in range(cm.shape[0]):
+        row_total = max(int(cm[row_idx].sum()), 1)
+        for col_idx in range(cm.shape[1]):
+            count = int(cm[row_idx, col_idx])
+            pct = 100.0 * count / row_total
+            ax.text(col_idx, row_idx, f'{count}\n({pct:.1f}%)', ha='center', va='center', fontsize=9)
+
+    ax.set_xticks(np.arange(len(class_labels)))
+    ax.set_yticks(np.arange(len(class_labels)))
+    ax.set_xticklabels(class_labels, rotation=20, ha='right')
+    ax.set_yticklabels(class_labels)
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Ground Truth')
+    ax.set_title(title, fontweight='bold', fontsize=10)
+    fig.colorbar(im, ax=ax, fraction=0.040, pad=0.02)
+    fig.tight_layout()
+    return fig
+
+
 def _standardize_for_plot(series: np.ndarray) -> np.ndarray:
     """Return a z-scored copy for visualization only.
 
@@ -135,6 +264,7 @@ def _select_panel_indices_with_metadata(
     seed: int,
     sample_end_times_s: Optional[np.ndarray],
     recording_ids: Optional[np.ndarray],
+    preferred_recording_substring: Optional[str] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Select contiguous panel indices from a single recording when metadata exists.
 
@@ -203,7 +333,16 @@ def _select_panel_indices_with_metadata(
         else:
             tier_any.append(rec_id)
 
-    if len(tier_full) > 0:
+    pref = (preferred_recording_substring or "").strip().lower()
+    preferred_pool = []
+    if pref:
+        for rec_id in np.concatenate([np.asarray(tier_full), np.asarray(tier_preictal), np.asarray(tier_any)]):
+            if pref in str(rec_id).lower():
+                preferred_pool.append(rec_id)
+
+    if len(preferred_pool) > 0:
+        chosen_rec = rng.choice(preferred_pool)
+    elif len(tier_full) > 0:
         chosen_rec = rng.choice(tier_full)
     elif len(tier_preictal) > 0:
         chosen_rec = rng.choice(tier_preictal)
@@ -554,6 +693,13 @@ class Trainer:
             logger.info(f"Val loader: {len(val_loader)} batches")
             if long_sweep_mode:
                 logger.info("Long-sweep dataloader mode enabled: preserving temporal order, no random sampling")
+                online_aug_enabled = bool(getattr(train_dataset, '_online_aug_enabled', False))
+                online_aug_prob = float(getattr(train_dataset, '_online_aug_probability', 0.0))
+                logger.info(
+                    "Long-sweep online augmentation: enabled=%s, probability=%.2f",
+                    online_aug_enabled,
+                    online_aug_prob,
+                )
             if hasattr(train_dataset, 'class_distribution'):
                 logger.info(f"Train class distribution: {train_dataset.class_distribution}")
             if hasattr(val_dataset, 'class_distribution'):
@@ -687,7 +833,7 @@ class Trainer:
 
             # Clamp to reasonable ranges (features in a modest band, labels in
             # [-1, output_max], weights positive and not extreme).
-            features = torch.clamp(features, -20.0, 20.0)
+            features = torch.clamp(features, -200.0, 200.0)
             labels = torch.clamp(labels, -1.0, float(self.config.model.output_countdown_max))
             weights = torch.clamp(weights, 0.0, 10.0)
             
@@ -853,10 +999,14 @@ class Trainer:
         all_eeg_proxy = []
         all_ppg_proxy = []
         all_eda_proxy = []
+        all_adxl_proxy = []
         all_hr_proxy = []
         all_hrv_proxy = []
         
         signal_label: Optional[str] = None
+        loss_type = str(getattr(self.config.loss, 'loss_type', 'countdown')).lower()
+        state_mode = loss_type == 'state'
+        onset_threshold_min = float(getattr(self.config.loss, 'onset_threshold_min', 2.0))
 
         with torch.no_grad():
             val_iter = self._progress(
@@ -876,7 +1026,12 @@ class Trainer:
                 labels = torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
                 weights = torch.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
 
-                features = torch.clamp(features, -20.0, 20.0)
+                # Save raw (pre-clamp) features for proxy/visualization extraction
+                # so that physiological values (e.g., HR in BPM ~60-120) are not
+                # destroyed by the [-20, 20] clamp used for model stability.
+                features_raw_cpu = features.cpu()
+
+                features = torch.clamp(features, -200.0, 200.0)
                 labels = torch.clamp(labels, -1.0, float(self.config.model.output_countdown_max))
                 weights = torch.clamp(weights, 0.0, 10.0)
                 
@@ -903,7 +1058,7 @@ class Trainer:
                 # separate ECG and EEG proxy scalars per sample so that the
                 # visualization can show paired traces. For single-modal
                 # models, fall back to a single best-variance channel.
-                full_features = features.detach().cpu().numpy()
+                full_features = features_raw_cpu.numpy()
                 n_feat = full_features.shape[-1]
                 source = getattr(self.config.data, "data_source", "bids")
 
@@ -931,7 +1086,10 @@ class Trainer:
 
                     if source == "wearable":
                         ppg_sequences = ecg_block[:, :, 0] if ecg_block.shape[-1] > 0 else ecg_sequences
+                        # Channel 1 of ecg_block = ADXL accelerometer stream
+                        adxl_sequences = ecg_block[:, :, 1] if ecg_block.shape[-1] > 1 else np.zeros_like(ppg_sequences)
                         eda_sequences = eeg_block[:, :, 0] if eeg_block.shape[-1] > 0 else np.zeros_like(ppg_sequences)
+                        all_adxl_proxy.extend(adxl_sequences[:, mid_idx])
                     else:
                         ppg_sequences = ecg_sequences
                         eda_sequences = np.zeros_like(ecg_sequences)
@@ -960,7 +1118,10 @@ class Trainer:
 
                     if source == "wearable":
                         ppg_sequences = full_features[:, :, 0] if n_feat > 0 else signal_sequences
+                        # Channel 1 = ADXL accelerometer stream
+                        adxl_sequences = full_features[:, :, 1] if n_feat > 1 else np.zeros_like(ppg_sequences)
                         eda_sequences = full_features[:, :, 2] if n_feat > 2 else np.zeros_like(ppg_sequences)
+                        all_adxl_proxy.extend(adxl_sequences[:, mid_idx])
                     else:
                         ppg_sequences = signal_sequences
                         eda_sequences = np.zeros_like(signal_sequences)
@@ -973,7 +1134,7 @@ class Trainer:
                     # from numeric metrics.
                     if signal_label is None:
                         if source == "wearable":
-                            signal_label = f"PPG proxy (feat_ch={best_ch})"
+                            signal_label = f"HR signal (feat_ch={best_ch})"
                         else:
                             signal_label = f"ECG proxy (feat_ch={best_ch})"
 
@@ -1020,6 +1181,17 @@ class Trainer:
         metrics['val_mae'] = mae
         metrics['val_medae'] = medae
         metrics['val_rmse'] = rmse
+
+        alert_metrics = _compute_binary_metrics(
+            (all_true_countdown >= 0).astype(np.int32),
+            np.array(all_pred_preictal, dtype=np.float32),
+            float(self.config.loss.detection_threshold),
+        )
+        metrics['val_alert_balanced_accuracy'] = alert_metrics['balanced_accuracy']
+        metrics['val_alert_sensitivity'] = alert_metrics['sensitivity']
+        metrics['val_alert_specificity'] = alert_metrics['specificity']
+        metrics['val_alert_precision'] = alert_metrics['precision']
+        metrics['val_alert_f1'] = alert_metrics['f1']
         
         ecg_proxy_arr = np.array(all_ecg_proxy, dtype=np.float32)
         eeg_proxy_arr = (
@@ -1037,6 +1209,11 @@ class Trainer:
             if len(all_eda_proxy) == len(all_ecg_proxy) and len(all_eda_proxy) > 0
             else None
         )
+        adxl_proxy_arr = (
+            np.array(all_adxl_proxy, dtype=np.float32)
+            if len(all_adxl_proxy) == len(all_ecg_proxy) and len(all_adxl_proxy) > 0
+            else None
+        )
 
         viz_payload = {
             'pred_preictal': np.array(all_pred_preictal, dtype=np.float32),
@@ -1051,12 +1228,49 @@ class Trainer:
             'hr_proxy': np.array(all_hr_proxy, dtype=np.float32),
             'hrv_proxy': np.array(all_hrv_proxy, dtype=np.float32),
         }
+        if state_mode:
+            state_probs = _derive_state_probabilities(
+                viz_payload['pred_preictal'],
+                viz_payload['pred_countdown'],
+            )
+            true_state = _derive_state_targets(all_true_countdown, onset_threshold_min)
+            state_balanced_accuracy, state_cm, state_recalls = _compute_multiclass_balanced_accuracy(
+                true_state,
+                state_probs['pred_state'],
+                3,
+            )
+            onset_metrics = _compute_binary_metrics(
+                (true_state == 2).astype(np.int32),
+                state_probs['onset_joint_prob'],
+                0.5,
+            )
+            metrics['val_state_balanced_accuracy'] = state_balanced_accuracy
+            metrics['val_state_accuracy'] = float(np.mean(state_probs['pred_state'] == true_state))
+            metrics['val_interictal_recall'] = float(state_recalls[0])
+            metrics['val_preictal_recall'] = float(state_recalls[1])
+            metrics['val_onset_recall'] = float(state_recalls[2])
+            metrics['val_onset_balanced_accuracy'] = onset_metrics['balanced_accuracy']
+            metrics['val_onset_sensitivity'] = onset_metrics['sensitivity']
+            metrics['val_onset_specificity'] = onset_metrics['specificity']
+            metrics['val_onset_precision'] = onset_metrics['precision']
+            metrics['val_onset_f1'] = onset_metrics['f1']
+            viz_payload['state_mode'] = True
+            viz_payload['true_state'] = true_state.astype(np.int32)
+            viz_payload['pred_state'] = state_probs['pred_state'].astype(np.int32)
+            viz_payload['pred_onset_prob'] = state_probs['onset_joint_prob'].astype(np.float32)
+            viz_payload['pred_preictal_only_prob'] = state_probs['preictal_only_prob'].astype(np.float32)
+            viz_payload['pred_interictal_prob'] = state_probs['interictal_prob'].astype(np.float32)
+            viz_payload['state_confusion_matrix'] = state_cm.astype(np.int32)
+        else:
+            viz_payload['state_mode'] = False
         if eeg_proxy_arr is not None:
             viz_payload['eeg_proxy'] = eeg_proxy_arr
         if ppg_proxy_arr is not None:
             viz_payload['ppg_proxy'] = ppg_proxy_arr
         if eda_proxy_arr is not None:
             viz_payload['eda_proxy'] = eda_proxy_arr
+        if adxl_proxy_arr is not None:
+            viz_payload['adxl_proxy'] = adxl_proxy_arr
 
         # Propagate signal source label if we tracked it.
         if signal_label is not None:
@@ -1089,6 +1303,11 @@ class Trainer:
         true_preictal = viz_payload['true_preictal']
         pred_countdown = viz_payload['pred_countdown']
         true_countdown = viz_payload['true_countdown']
+        state_mode = bool(viz_payload.get('state_mode', False))
+        pred_onset_prob_full = viz_payload.get('pred_onset_prob')
+        pred_preictal_only_prob_full = viz_payload.get('pred_preictal_only_prob')
+        true_state_full = viz_payload.get('true_state')
+        pred_state_full = viz_payload.get('pred_state')
 
         # Prefer explicit ECG/EEG proxies when available, but fall back to
         # the original single-channel signal_proxy for backward compatibility.
@@ -1096,6 +1315,7 @@ class Trainer:
         ppg_proxy = viz_payload.get('ppg_proxy', ecg_proxy)
         eda_proxy = viz_payload.get('eda_proxy', None)
         eeg_proxy = viz_payload.get('eeg_proxy', None)
+        adxl_proxy = viz_payload.get('adxl_proxy', None)
         hr_proxy = viz_payload.get('hr_proxy', np.zeros_like(ecg_proxy, dtype=np.float32))
         hrv_proxy = viz_payload.get('hrv_proxy', np.zeros_like(ecg_proxy, dtype=np.float32))
 
@@ -1105,8 +1325,9 @@ class Trainer:
         # continuous context around a seizure, not a shuffled concatenation
         # of many independent windows.
         time_axis_minutes: Optional[np.ndarray]
-        if (not self.distributed) and 'sample_end_times_s' in viz_payload and 'recording_ids' in viz_payload:
+        if 'sample_end_times_s' in viz_payload and 'recording_ids' in viz_payload:
             panel_window_minutes = float(getattr(self.training_config, 'epoch_panel_window_minutes', 180.0))
+            preferred_recording = getattr(self.training_config, 'epoch_panel_preferred_recording', None)
             selected, time_axis_minutes = _select_panel_indices_with_metadata(
                 true_countdown,
                 feature_step_s=float(self.config.data.feature_step_s),
@@ -1114,6 +1335,7 @@ class Trainer:
                 seed=int(self.config.data.random_seed) + int(epoch),
                 sample_end_times_s=viz_payload['sample_end_times_s'],
                 recording_ids=viz_payload['recording_ids'],
+                preferred_recording_substring=preferred_recording,
             )
         else:
             # Fallback: keep native sample order for this rank.
@@ -1154,12 +1376,33 @@ class Trainer:
         true_preictal = true_preictal[selected]
         pred_countdown = pred_countdown[selected]
         true_countdown = true_countdown[selected]
+        pred_onset_prob = (
+            pred_onset_prob_full[selected]
+            if pred_onset_prob_full is not None and len(pred_onset_prob_full) == len(viz_payload['pred_preictal'])
+            else None
+        )
+        pred_preictal_only_prob = (
+            pred_preictal_only_prob_full[selected]
+            if pred_preictal_only_prob_full is not None and len(pred_preictal_only_prob_full) == len(viz_payload['pred_preictal'])
+            else None
+        )
+        true_state = (
+            true_state_full[selected]
+            if true_state_full is not None and len(true_state_full) == len(viz_payload['pred_preictal'])
+            else None
+        )
+        pred_state = (
+            pred_state_full[selected]
+            if pred_state_full is not None and len(pred_state_full) == len(viz_payload['pred_preictal'])
+            else None
+        )
 
         # Keep raw proxies for any downstream numeric use.
         ecg_proxy_raw = ecg_proxy[selected]
         ppg_proxy_raw = ppg_proxy[selected] if ppg_proxy is not None and len(ppg_proxy) == len(ecg_proxy) else ecg_proxy_raw
         eda_proxy_raw = eda_proxy[selected] if eda_proxy is not None and len(eda_proxy) == len(ecg_proxy) else None
         eeg_proxy_raw = eeg_proxy[selected] if eeg_proxy is not None and len(eeg_proxy) == len(ecg_proxy) else None
+        adxl_proxy_raw = adxl_proxy[selected] if adxl_proxy is not None and len(adxl_proxy) == len(ecg_proxy) else None
         hr_proxy_raw = hr_proxy[selected]
         hrv_proxy_raw = hrv_proxy[selected]
 
@@ -1174,6 +1417,7 @@ class Trainer:
         ppg_proxy_plot = _standardize_for_plot(ppg_proxy_raw)
         eda_proxy_plot = _standardize_for_plot(eda_proxy_raw) if eda_proxy_raw is not None else None
         eeg_proxy_plot = _standardize_for_plot(eeg_proxy_raw) if eeg_proxy_raw is not None else None
+        adxl_proxy_plot = adxl_proxy_raw if adxl_proxy_raw is not None else None
         # For wearable runs, keep HR/HRV proxies in their synthetic
         # physiological units so that plots show meaningful ranges instead of
         # z-scored lines around zero; the top "Signal" uses the z-scored
@@ -1250,6 +1494,7 @@ class Trainer:
             ppg_signal=ppg_proxy_plot,
             eda_signal=eda_proxy_plot,
             eeg_signal=eeg_proxy_plot,
+            adxl_series=adxl_proxy_plot,
             hr_series=hr_proxy_plot,
             hrv_series=hrv_proxy_plot,
             true_countdown=true_countdown,
@@ -1266,6 +1511,11 @@ class Trainer:
             title_prefix=f"{self.config.model.model_type} — {dataset_tag} — epoch {epoch}",
             footer_text=panel_footer,
             signal_label=signal_label,
+            pred_onset_prob=pred_onset_prob,
+            pred_preictal_only_prob=pred_preictal_only_prob,
+            gt_onset=None if true_state is None else (true_state == 2).astype(np.int32),
+            gt_preictal_only=None if true_state is None else (true_state == 1).astype(np.int32),
+            visualization_mode='state' if state_mode else 'countdown',
         )
         self.epoch_visualizer.save_figure(fig_panel, f"epoch_{epoch:03d}_gt_vs_inference_panel", step=epoch)
 
@@ -1278,36 +1528,159 @@ class Trainer:
                 else:
                     x_minutes = np.asarray(time_axis_minutes, dtype=np.float32)
 
-                gt_countdown_ref = np.zeros_like(true_countdown, dtype=np.float32)
-                gt_mask = true_countdown >= 0
-                if np.any(gt_mask):
-                    gt_countdown_ref[gt_mask] = np.clip(true_countdown[gt_mask] / 10.0, 0.0, 1.0)
-                pred_countdown_ref = np.clip(pred_countdown.astype(np.float32) / 10.0, 0.0, 1.0)
                 alarm_smooth = pred_preictal_smooth_sel if pred_preictal_smooth_sel is not None else pred_preictal
+                if state_mode and pred_onset_prob is not None and pred_preictal_only_prob is not None and true_state is not None and pred_state is not None:
+                    table = wandb.Table(columns=[
+                        'time_min', 'ppg_proxy', 'eda_proxy', 'eeg_proxy', 'hr', 'hrv',
+                        'alert_prob', 'alert_smooth', 'preictal_prob', 'onset_prob',
+                        'gt_active', 'gt_preictal', 'gt_onset', 'pred_state', 'gt_state'
+                    ])
+                    for i in range(len(x_minutes)):
+                        table.add_data(
+                            float(x_minutes[i]),
+                            float(ppg_proxy_plot[i]),
+                            float(eda_proxy_plot[i]) if eda_proxy_plot is not None else 0.0,
+                            float(eeg_proxy_plot[i]) if eeg_proxy_plot is not None else 0.0,
+                            float(hr_proxy_plot[i]),
+                            float(hrv_proxy_plot[i]),
+                            float(np.clip(pred_preictal[i], 0.0, 1.0)),
+                            float(np.clip(alarm_smooth[i], 0.0, 1.0)),
+                            float(np.clip(pred_preictal_only_prob[i], 0.0, 1.0)),
+                            float(np.clip(pred_onset_prob[i], 0.0, 1.0)),
+                            int(true_state[i] > 0),
+                            int(true_state[i] == 1),
+                            int(true_state[i] == 2),
+                            int(pred_state[i]),
+                            int(true_state[i]),
+                        )
+                else:
+                    gt_mask = true_countdown >= 0
+                    positive_gt = true_countdown[gt_mask]
+                    observed_gt_max = float(np.max(positive_gt)) if positive_gt.size > 0 else 0.0
+                    if observed_gt_max <= 1.5:
+                        countdown_ref_max = 1.0
+                    else:
+                        countdown_ref_max = max(30.0, observed_gt_max)
 
-                table = wandb.Table(columns=[
-                    'time_min', 'ppg_proxy', 'eda_proxy', 'eeg_proxy', 'hr', 'hrv',
-                    'alarm_raw', 'alarm_smooth', 'gt_countdown_ref', 'pred_countdown_ref', 'gt_preictal'
-                ])
-                for i in range(len(x_minutes)):
-                    table.add_data(
-                        float(x_minutes[i]),
-                        float(ppg_proxy_plot[i]),
-                        float(eda_proxy_plot[i]) if eda_proxy_plot is not None else 0.0,
-                        float(eeg_proxy_plot[i]) if eeg_proxy_plot is not None else 0.0,
-                        float(hr_proxy_plot[i]),
-                        float(hrv_proxy_plot[i]),
-                        float(np.clip(pred_preictal[i], 0.0, 1.0)),
-                        float(np.clip(alarm_smooth[i], 0.0, 1.0)),
-                        float(gt_countdown_ref[i]),
-                        float(pred_countdown_ref[i]),
-                        int(true_countdown[i] >= 0),
-                    )
+                    gt_countdown_ref = np.full_like(true_countdown, countdown_ref_max, dtype=np.float32)
+                    if np.any(gt_mask):
+                        gt_countdown_ref[gt_mask] = true_countdown[gt_mask]
+                    gt_countdown_ref = np.clip(gt_countdown_ref / countdown_ref_max, 0.0, 1.0)
 
-                wandb.log({
+                    pred_scale = max(countdown_ref_max, float(np.max(np.abs(pred_countdown))) + 1e-6)
+                    pred_countdown_ref = np.clip(pred_countdown.astype(np.float32) / pred_scale, 0.0, 1.0)
+
+                    table = wandb.Table(columns=[
+                        'time_min', 'ppg_proxy', 'eda_proxy', 'eeg_proxy', 'hr', 'hrv',
+                        'alarm_raw', 'alarm_smooth', 'gt_countdown_ref', 'pred_countdown_ref', 'gt_preictal'
+                    ])
+                    for i in range(len(x_minutes)):
+                        table.add_data(
+                            float(x_minutes[i]),
+                            float(ppg_proxy_plot[i]),
+                            float(eda_proxy_plot[i]) if eda_proxy_plot is not None else 0.0,
+                            float(eeg_proxy_plot[i]) if eeg_proxy_plot is not None else 0.0,
+                            float(hr_proxy_plot[i]),
+                            float(hrv_proxy_plot[i]),
+                            float(np.clip(pred_preictal[i], 0.0, 1.0)),
+                            float(np.clip(alarm_smooth[i], 0.0, 1.0)),
+                            float(gt_countdown_ref[i]),
+                            float(pred_countdown_ref[i]),
+                            int(true_countdown[i] >= 0),
+                        )
+
+                log_payload = {
                     'visualizations/epoch_timeseries_table': table,
                     'visualizations/epoch': int(epoch),
-                })
+                }
+
+                # Token waterfall explainability artifact (epoch-level).
+                try:
+                    n_countdown_bins = int(getattr(self.training_config, 'token_countdown_bins', 8))
+                    n_prob_bins = int(getattr(self.training_config, 'token_prob_bins', 4))
+                    token_window = max(1, int(getattr(self.training_config, 'token_waterfall_window', 25)))
+
+                    if state_mode and pred_onset_prob is not None:
+                        alert_prob = np.clip(pred_preictal.astype(np.float32), 0.0, 0.999999)
+                        onset_prob_sel = np.clip(pred_onset_prob.astype(np.float32), 0.0, 0.999999)
+                        alert_bin = np.minimum((alert_prob * n_prob_bins).astype(np.int32), n_prob_bins - 1)
+                        onset_bin = np.minimum((onset_prob_sel * n_prob_bins).astype(np.int32), n_prob_bins - 1)
+                        token_id = alert_bin * n_prob_bins + onset_bin
+                        token_total = n_prob_bins * n_prob_bins
+                    else:
+                        max_countdown = max(10.0, float(np.max(np.clip(true_countdown, 0.0, None))))
+                        pred_prob = np.clip(pred_preictal.astype(np.float32), 0.0, 0.999999)
+                        pred_cd = pred_countdown.astype(np.float32)
+
+                        countdown_bin = np.zeros_like(pred_cd, dtype=np.int32)
+                        pre_mask = pred_cd >= 0.0
+                        if np.any(pre_mask):
+                            frac = np.clip(pred_cd[pre_mask] / max_countdown, 0.0, 0.999999)
+                            countdown_bin[pre_mask] = 1 + np.minimum((frac * n_countdown_bins).astype(np.int32), n_countdown_bins - 1)
+
+                        prob_bin = np.minimum((pred_prob * n_prob_bins).astype(np.int32), n_prob_bins - 1)
+                        token_id = countdown_bin * n_prob_bins + prob_bin
+                        token_total = (n_countdown_bins + 1) * n_prob_bins
+
+                    one_hot = np.zeros((len(token_id), token_total), dtype=np.float32)
+                    one_hot[np.arange(len(token_id)), np.clip(token_id, 0, token_total - 1)] = 1.0
+
+                    kernel = np.ones(token_window, dtype=np.float32) / float(token_window)
+                    token_roll = np.zeros_like(one_hot)
+                    for col in range(one_hot.shape[1]):
+                        token_roll[:, col] = np.convolve(one_hot[:, col], kernel, mode='same')
+
+                    import matplotlib.pyplot as _plt
+                    fig_tw, ax_tw = _plt.subplots(figsize=(12, 4))
+                    im = ax_tw.imshow(
+                        token_roll.T,
+                        aspect='auto',
+                        origin='lower',
+                        interpolation='nearest',
+                        cmap='magma',
+                    )
+                    waterfall_title = 'State Token Waterfall' if state_mode else 'Token Waterfall'
+                    ax_tw.set_title(f'{waterfall_title} (epoch {int(epoch):03d}, window={token_window})')
+                    ax_tw.set_xlabel('Sample index')
+                    ax_tw.set_ylabel('Token ID')
+                    fig_tw.colorbar(im, ax=ax_tw, fraction=0.03, pad=0.01, label='Rolling occupancy')
+
+                    token_path = self.save_dir / 'epoch_visualizations' / f'epoch_{int(epoch):03d}_token_waterfall.png'
+                    fig_tw.savefig(token_path, dpi=160, bbox_inches='tight')
+                    _plt.close(fig_tw)
+
+                    log_payload['visualizations/token_waterfall'] = wandb.Image(str(token_path))
+                except Exception as token_exc:
+                    logger.warning('Failed to generate/log token waterfall for epoch %d: %s', int(epoch), str(token_exc))
+
+                try:
+                    alert_metrics = _compute_binary_metrics(
+                        (viz_payload['true_countdown'] >= 0).astype(np.int32),
+                        viz_payload['pred_preictal'],
+                        float(self.config.loss.detection_threshold),
+                    )
+                    alert_cm = np.array([
+                        [int(alert_metrics['tn']), int(alert_metrics['fp'])],
+                        [int(alert_metrics['fn']), int(alert_metrics['tp'])],
+                    ], dtype=np.int32)
+                    fig_alert_cm = _build_confusion_matrix_figure(
+                        alert_cm,
+                        ('Interictal', 'Alert'),
+                        f'Alert confusion matrix | epoch {int(epoch):03d}',
+                    )
+                    log_payload['visualizations/alert_confusion_matrix'] = wandb.Image(fig_alert_cm)
+
+                    if state_mode and 'state_confusion_matrix' in viz_payload:
+                        fig_state_cm = _build_confusion_matrix_figure(
+                            np.asarray(viz_payload['state_confusion_matrix']),
+                            ('Interictal', 'Preictal', 'Onset'),
+                            f'State confusion matrix | epoch {int(epoch):03d}',
+                        )
+                        log_payload['visualizations/state_confusion_matrix'] = wandb.Image(fig_state_cm)
+                except Exception as cm_exc:
+                    logger.warning('Failed to generate/log confusion matrices for epoch %d: %s', int(epoch), str(cm_exc))
+
+                wandb.log(log_payload)
             except Exception as e:
                 logger.warning("Failed to log interactive epoch timeline table to wandb: %s", str(e))
     
@@ -1334,8 +1707,10 @@ class Trainer:
         # Create model and optimizer
         model, optimizer, scheduler = self.create_model_optimizer_scheduler()
         
-        # Create loss function
-        criterion = LossFactory.create_loss(self.config.loss)
+        # Create loss function — supports 'state' (safe 3-class, no countdown regression)
+        # or 'countdown' (legacy regression).  Read from config or auto-detect.
+        _loss_type = str(getattr(self.config.loss, 'loss_type', 'countdown')).lower()
+        criterion = LossFactory.create_loss(self.config.loss, loss_type=_loss_type)
         criterion = criterion.to(self.device)
         
         # Training history
@@ -1368,6 +1743,22 @@ class Trainer:
             return delta, pct
         
         for epoch in range(1, self.training_config.num_epochs + 1):
+            # Advance ring-buffer window if training dataset supports it.
+            # Step size defaults to 10 % of the buffer so the window overlaps
+            # and the model sees each sample several times in different contexts.
+            from src.data_loader import TemporalRingBufferDataset as _RingDS
+            if isinstance(train_dataset, _RingDS):
+                _ring_step = max(1, int(len(train_dataset) * 0.10))
+                train_dataset.advance_to_epoch(epoch - 1, step=_ring_step)
+                if self._is_main_process():
+                    logger.info(
+                        "Ring buffer epoch %d: offset=%d / %d  [window_size=%d]",
+                        epoch,
+                        train_dataset._offset,
+                        len(train_dataset._dataset),
+                        len(train_dataset),
+                    )
+
             # Train
             train_metrics, train_viz_payload = self.train_epoch(model, train_loader, criterion, optimizer, epoch)
             
@@ -1442,8 +1833,25 @@ class Trainer:
                         "val/mae": val_mae,
                         "val/medae": val_metrics['val_medae'],
                         "val/rmse": val_metrics['val_rmse'],
+                        "val/alert_balanced_accuracy": val_metrics.get('val_alert_balanced_accuracy', 0.0),
+                        "val/alert_sensitivity": val_metrics.get('val_alert_sensitivity', 0.0),
+                        "val/alert_specificity": val_metrics.get('val_alert_specificity', 0.0),
+                        "val/alert_precision": val_metrics.get('val_alert_precision', 0.0),
+                        "val/alert_f1": val_metrics.get('val_alert_f1', 0.0),
                         "learning_rate": optimizer.param_groups[0]['lr'],
                     }
+
+                    if 'val_state_balanced_accuracy' in val_metrics:
+                        log_payload["val/state_balanced_accuracy"] = val_metrics['val_state_balanced_accuracy']
+                        log_payload["val/state_accuracy"] = val_metrics.get('val_state_accuracy', 0.0)
+                        log_payload["val/interictal_recall"] = val_metrics.get('val_interictal_recall', 0.0)
+                        log_payload["val/preictal_recall"] = val_metrics.get('val_preictal_recall', 0.0)
+                        log_payload["val/onset_recall"] = val_metrics.get('val_onset_recall', 0.0)
+                        log_payload["val/onset_balanced_accuracy"] = val_metrics.get('val_onset_balanced_accuracy', 0.0)
+                        log_payload["val/onset_sensitivity"] = val_metrics.get('val_onset_sensitivity', 0.0)
+                        log_payload["val/onset_specificity"] = val_metrics.get('val_onset_specificity', 0.0)
+                        log_payload["val/onset_precision"] = val_metrics.get('val_onset_precision', 0.0)
+                        log_payload["val/onset_f1"] = val_metrics.get('val_onset_f1', 0.0)
 
                     # Also expose per-epoch percentage changes for charts (0.0 on baseline)
                     if pct_train is not None:

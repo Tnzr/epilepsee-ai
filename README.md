@@ -43,9 +43,13 @@ cp .env.example .env   # then fill in your values
 | `BIDS_DATASET_ROOT` | Path to SeizeIT2 BIDS dataset (ds005873) |
 | `WEARABLE_DATASET_ROOT` | Path to Oregon VSM wearable dataset |
 | `OUTPUT_DIR` | Where to save models/logs (default: `./models`) |
+| `EPILEPSEE_CACHE_DIR` | Optional persistent dataset cache directory (default: `./models/cache/datasets`) |
 | `WANDB_API_KEY` | Weights & Biases API key from https://wandb.ai/authorize |
 
 All training commands also accept `--dataset-root /path/to/data` for one-off overrides.
+Real-data preprocessing caches are persisted under `./models/cache/datasets` by default, so matching reruns can reuse extracted datasets instead of rebuilding them from scratch.
+
+Long-sweep runs use memory-light online preictal augmentation (no offline dataset expansion) when `augment_preictal: true` and `online_preictal_augmentation: true` in config.
 
 ---
 

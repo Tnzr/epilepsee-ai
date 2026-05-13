@@ -5,7 +5,7 @@ Seizure anticipation package: ECG-centered seizure countdown prediction.
 __version__ = "1.0.0"
 __author__ = "Epilepsee-AI Team"
 
-from .data_loader import BIDSDataLoader, SeizureDataset, SubjectDataCache, WearableDeviceDataLoader
+from .data_loader import BIDSDataLoader, SeizureDataset, SubjectDataCache, WearableDeviceDataLoader, TemporalRingBufferDataset
 from .preprocessing import ECGPreprocessor, MotionDetector, SignalProcessor, SignalNormalizer
 from .feature_extraction import FeatureExtractor, HRVCalculator, InstabilityExtractor, SpectralFeatureExtractor
 
@@ -17,7 +17,7 @@ except ImportError:
     logging.getLogger(__name__).warning("torch not available - model imports skipped")
 
 try:
-    from .losses import SeizureCountdownLoss, WeightedMSELoss, FocalLoss, LossFactory
+    from .losses import SeizureCountdownLoss, SeizureStateLoss, WeightedMSELoss, FocalLoss, LossFactory
 except ImportError:
     pass
 
@@ -35,6 +35,7 @@ __all__ = [
     'BIDSDataLoader',
     'WearableDeviceDataLoader',
     'SeizureDataset',
+    'TemporalRingBufferDataset',
     'SubjectDataCache',
     'ECGPreprocessor',
     'MotionDetector',

@@ -187,8 +187,44 @@ class BIDSDataLoader:
         else:
             logger.warning("pybids not available, using fallback directory scanning")
             self.bids_layout = None
+
+        # Cache resolved EDF paths so selection and loading do not repeatedly
+        # scan the same directories or reopen files just to prove they exist.
+        self._edf_path_cache: Dict[Tuple[str, str, str, Optional[int]], Path] = {}
         
         logger.info(f"Initialized BIDS dataset loader from {self.dataset_root}")
+
+    def resolve_subject_edf_path(
+        self,
+        subject_id: str,
+        session_id: str = "01",
+        datatype: str = "ecg",
+        run_id: Optional[int] = None,
+    ) -> Path:
+        """Resolve the EDF path for a subject/run without loading file contents."""
+        cache_key = (str(subject_id), str(session_id), str(datatype), run_id)
+        cached = self._edf_path_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        subject_dir = self.dataset_root / f"sub-{subject_id}" / f"ses-{session_id}" / datatype
+
+        if not subject_dir.exists():
+            raise FileNotFoundError(f"Subject data not found: {subject_dir}")
+
+        edf_files = sorted(subject_dir.glob("*.edf"))
+        if not edf_files:
+            raise FileNotFoundError(f"No EDF files found in {subject_dir}")
+
+        if run_id is not None:
+            edf_file = next((f for f in edf_files if f"run-{run_id:02d}" in f.name), None)
+            if edf_file is None:
+                raise FileNotFoundError(f"Run {run_id} not found in {subject_dir}")
+        else:
+            edf_file = edf_files[0]
+
+        self._edf_path_cache[cache_key] = edf_file
+        return edf_file
     
     def get_subjects(self) -> List[str]:
         """Get list of all subject IDs."""
@@ -218,24 +254,12 @@ class BIDSDataLoader:
         if not HAS_MNE:
             raise ImportError("MNE-Python required for EDF loading. Install: pip install mne")
         
-        # Build path (subject_id is already a string from get_subjects)
-        subject_dir = self.dataset_root / f"sub-{subject_id}" / f"ses-{session_id}" / datatype
-        
-        if not subject_dir.exists():
-            raise FileNotFoundError(f"Subject data not found: {subject_dir}")
-        
-        # Find EDF files
-        edf_files = sorted(subject_dir.glob("*.edf"))
-        if not edf_files:
-            raise FileNotFoundError(f"No EDF files found in {subject_dir}")
-        
-        # Select file
-        if run_id is not None:
-            edf_file = next((f for f in edf_files if f"run-{run_id:02d}" in f.name), None)
-            if edf_file is None:
-                raise FileNotFoundError(f"Run {run_id} not found in {subject_dir}")
-        else:
-            edf_file = edf_files[0]  # Take first run
+        edf_file = self.resolve_subject_edf_path(
+            subject_id,
+            session_id=session_id,
+            datatype=datatype,
+            run_id=run_id,
+        )
         
         # Load with MNE
         try:
@@ -448,11 +472,12 @@ class SeizureDataset:
             sample_end_times_s: (N,) - sample end-time in seconds within recording
             recording_ids: (N,) - recording identifier for each sample
         """
-        self.features = features.astype(np.float32)
-        self.labels = labels.astype(np.float32)
+        # Avoid unconditional copies for very large real datasets.
+        self.features = np.asarray(features, dtype=np.float32)
+        self.labels = np.asarray(labels, dtype=np.float32)
         self.subject_ids = subject_ids
         self.seizure_ids = seizure_ids
-        self.sample_end_times_s = None if sample_end_times_s is None else sample_end_times_s.astype(np.float32)
+        self.sample_end_times_s = None if sample_end_times_s is None else np.asarray(sample_end_times_s, dtype=np.float32)
         self.recording_ids = recording_ids
         
         # Compute pre-ictal labels (binary: seizure approaching?)
@@ -460,11 +485,20 @@ class SeizureDataset:
         
         # Compute sample weights (late predictions more important)
         self.weights = self._compute_weights(labels)
+
+        # Optional memory-light online augmentation (applied in __getitem__).
+        self._online_aug_enabled = False
+        self._online_aug_probability = 0.0
+        self._online_aug_preictal_only = True
+        self._online_aug_cfg = None
+        self._online_aug_rng = None
         
         logger.info(f"Dataset: {len(self)} samples, {features.shape[1]} timesteps, {features.shape[2]} features")
     
     def _compute_weights(self, labels: np.ndarray) -> np.ndarray:
         """Compute temporal importance weights."""
+        if labels.size == 0:
+            return np.array([], dtype=np.float32)
         tau = 60.0  # seconds
         weights = np.where(
             labels >= 0,
@@ -484,7 +518,72 @@ class SeizureDataset:
         Returns:
             (features, countdown_label, weight)
         """
-        return self.features[idx], self.labels[idx], self.weights[idx]
+        features = self.features[idx]
+        label = self.labels[idx]
+
+        if (
+            self._online_aug_enabled
+            and self._online_aug_rng is not None
+            and (label >= 0 or not self._online_aug_preictal_only)
+            and float(self._online_aug_rng.random()) < self._online_aug_probability
+        ):
+            # Copy before augmentation so memory-mapped/cached arrays stay immutable.
+            features = self._apply_online_augmentation(np.array(features, dtype=np.float32, copy=True))
+
+        return features, label, self.weights[idx]
+
+    def enable_online_preictal_augmentation(
+        self,
+        config: DataConfig,
+        seed: int = 42,
+        probability: float = 0.7,
+        preictal_only: bool = True,
+    ) -> None:
+        """Enable stochastic augmentation during sample fetch.
+
+        This keeps chronology and dataset size unchanged while improving
+        training diversity for long-sweep runs.
+        """
+        self._online_aug_enabled = True
+        self._online_aug_cfg = config
+        self._online_aug_rng = np.random.default_rng(int(seed))
+        self._online_aug_probability = float(np.clip(probability, 0.0, 1.0))
+        self._online_aug_preictal_only = bool(preictal_only)
+
+    def _apply_online_augmentation(self, features: np.ndarray) -> np.ndarray:
+        """Apply one random augmentation transform to a sample."""
+        cfg = self._online_aug_cfg
+        rng = self._online_aug_rng
+        if cfg is None or rng is None:
+            return features.astype(np.float32, copy=False)
+
+        ops = []
+        if getattr(cfg, 'aug_time_warp_rates', None):
+            ops.append('time_warp')
+        if getattr(cfg, 'aug_amplitude_scales', None):
+            ops.append('amplitude')
+        if getattr(cfg, 'aug_noise_levels', None):
+            ops.append('noise')
+        if getattr(cfg, 'aug_time_shifts', None):
+            ops.append('shift')
+
+        if not ops:
+            return features.astype(np.float32, copy=False)
+
+        op = ops[int(rng.integers(0, len(ops)))]
+        if op == 'time_warp':
+            rate = float(rng.choice(np.asarray(cfg.aug_time_warp_rates, dtype=np.float32)))
+            return time_warp(features, rate)
+        if op == 'amplitude':
+            scale = float(rng.choice(np.asarray(cfg.aug_amplitude_scales, dtype=np.float32)))
+            return amplitude_scale(features, scale)
+        if op == 'noise':
+            noise_level = float(rng.choice(np.asarray(cfg.aug_noise_levels, dtype=np.float32)))
+            noise = rng.normal(0.0, noise_level, features.shape)
+            return (features + noise).astype(np.float32)
+
+        shift = int(rng.choice(np.asarray(cfg.aug_time_shifts, dtype=np.int32)))
+        return time_shift(features, shift)
     
     def get_subject_masks(self) -> Dict[str, np.ndarray]:
         """Get boolean masks for each subject."""
@@ -515,6 +614,101 @@ class SeizureDataset:
             'preictal': int(np.sum(self.preictal_labels)),
             'interictal': int(np.sum(1 - self.preictal_labels)),
         }
+
+
+class TemporalRingBufferDataset:
+    """Sliding-window view over a temporally-sorted SeizureDataset.
+
+    Simulates deployment conditions: the model only has access to the
+    most recent ``ring_buffer_size`` samples, older history is evicted.
+    This prevents the model from implicitly memorising cross-session
+    population statistics and keeps memory proportional to the window
+    rather than the full recording corpus.
+
+    Usage pattern (mirrors a ring-buffer / circular queue):
+
+        ds_sorted = SeizureDataset(features, labels, weights)   # time-sorted
+        ring = TemporalRingBufferDataset(ds_sorted, ring_buffer_size=2048)
+        for epoch in range(epochs):
+            ring.advance_to_epoch(epoch, step=512)
+            loader = DataLoader(ring, ...)
+            for batch in loader:
+                ...   # train on current window
+
+    Args:
+        dataset:          A SeizureDataset whose samples are ordered in time.
+        ring_buffer_size: Number of most-recent samples to expose at a time.
+                          Set to 0 (or len(dataset)) to disable windowing.
+        initial_offset:   Starting index (default 0 = beginning of recording).
+    """
+
+    def __init__(
+        self,
+        dataset: 'SeizureDataset',
+        ring_buffer_size: int = 0,
+        initial_offset: int = 0,
+    ):
+        self._dataset = dataset
+        total = len(dataset)
+        if ring_buffer_size <= 0 or ring_buffer_size >= total:
+            self._buf_size = total
+        else:
+            self._buf_size = int(ring_buffer_size)
+        self._offset = max(0, min(int(initial_offset), total - self._buf_size))
+
+    # ── Window control ────────────────────────────────────────────────────────
+
+    def advance_to_epoch(self, epoch: int, step: int = 0) -> None:
+        """Slide the window forward by ``step * epoch`` samples.
+
+        Clamps at the end of the dataset so the last window stays fully
+        in bounds.  When ``step == 0`` the window does not move (all
+        epochs see the same slice — useful for small datasets).
+        """
+        if step <= 0:
+            return
+        max_offset = max(0, len(self._dataset) - self._buf_size)
+        self._offset = min(max_offset, int(epoch) * int(step))
+
+    def set_offset(self, offset: int) -> None:
+        """Manually set the starting sample index of the current window."""
+        max_offset = max(0, len(self._dataset) - self._buf_size)
+        self._offset = max(0, min(int(offset), max_offset))
+
+    # ── Dataset interface ─────────────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return self._buf_size
+
+    def __getitem__(self, idx: int):
+        """Return the sample at *local* index ``idx`` within the current window."""
+        if idx < 0 or idx >= self._buf_size:
+            raise IndexError(f"Index {idx} out of ring buffer window [{self._offset}, {self._offset + self._buf_size})")
+        return self._dataset[self._offset + idx]
+
+    # ── Passthrough metadata ──────────────────────────────────────────────────
+
+    @property
+    def preictal_labels(self) -> np.ndarray:
+        """Boolean/float pre-ictal labels for samples in the current window."""
+        return self._dataset.preictal_labels[self._offset: self._offset + self._buf_size]
+
+    @property
+    def labels(self) -> np.ndarray:
+        """Raw countdown labels for samples in the current window."""
+        return self._dataset.labels[self._offset: self._offset + self._buf_size]
+
+    @property
+    def class_distribution(self) -> Dict[str, int]:
+        lbl = self.preictal_labels
+        return {
+            'preictal': int(np.sum(lbl)),
+            'interictal': int(len(lbl) - np.sum(lbl)),
+        }
+
+    def enable_online_preictal_augmentation(self, *args, **kwargs) -> None:
+        """Delegate to underlying dataset."""
+        self._dataset.enable_online_preictal_augmentation(*args, **kwargs)
 
 
 class WearableDeviceDataLoader:

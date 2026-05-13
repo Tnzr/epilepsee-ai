@@ -41,6 +41,10 @@ SEED ?= 42
 STRIDE_SWEEP ?= 0.2 0.5 1.0 2.0 5.0
 SWEEP_OUTPUT_DIR ?= models/sampling_sweeps
 LONG_SWEEP ?= 0
+ONLINE_AUG_PROB ?= 0.7
+STATE_LOSS ?= 0
+ONSET_THRESHOLD_MIN ?= 2.0
+RING_BUFFER_SIZE ?= 0
 
 TRAIN_ARGS = --model-type $(MODEL) --epochs $(EPOCHS) --batch-size $(BATCH) --learning-rate $(LR) --data-mode $(DATA_MODE) --data-source $(DATA_SOURCE) --max-recordings $(MAX_RECORDINGS) --max-samples-per-recording $(MAX_SAMPLES_PER_RECORDING)
 ifneq ($(strip $(DATASET_ROOT)),)
@@ -52,8 +56,20 @@ endif
 ifneq ($(strip $(CONFIG)),)
 TRAIN_ARGS += --config $(CONFIG)
 endif
+ifneq ($(strip $(ONLINE_AUG_PROB)),)
+TRAIN_ARGS += --online-aug-prob $(ONLINE_AUG_PROB)
+endif
 ifeq ($(strip $(LONG_SWEEP)),1)
 TRAIN_ARGS += --long-sweep-training
+endif
+ifeq ($(strip $(PATIENT_SEQUENTIAL)),1)
+TRAIN_ARGS += --patient-sequential
+endif
+ifeq ($(strip $(STATE_LOSS)),1)
+TRAIN_ARGS += --state-loss --onset-threshold-min $(ONSET_THRESHOLD_MIN)
+endif
+ifneq ($(strip $(RING_BUFFER_SIZE)),0)
+TRAIN_ARGS += --ring-buffer-size $(RING_BUFFER_SIZE)
 endif
 
 .PHONY: help test test-training train train-ddp train-dummy train-ddp-dummy \
@@ -65,6 +81,8 @@ endif
 	train-watch-eegnet-ddp train-watch-mobilenet-ddp train-watch-tcn-ddp \
 	train-wearable-recommended train-wearable-ddp train-wearable-config \
 	train-wearable-config-mobilenet \
+	train-patient-sequential train-patient-sequential-ddp \
+	train-safe-state-loss train-safe-state-loss-ring \
 	train-ecg-progression train-ecg-progression-ddp \
 	quantize quantize-eegnet quantize-mobilenet quantize-tcn \
 	quantize-temporal-fp16 quantize-multimodal-transformer-fp16 \
@@ -253,15 +271,36 @@ train-wearable-ddp: ## Recommended wearable countdown run: 2-GPU TCN (DDP) + aut
 		MAX_RECORDINGS=0 \
 		MAX_SAMPLES_PER_RECORDING=0
 
-train-ecg-progression: ## Run ECG-first progression: EEGNet -> MobileNet1D -> TCN
-	$(MAKE) train-watch-eegnet
-	$(MAKE) train-watch-mobilenet
-	$(MAKE) train-watch-tcn
+train-patient-sequential: ## Train with patient-by-patient sequential processing (BIDS dataset)
+	$(MAKE) train-auto-threshold \
+		MODEL=eegnet \
+		DATA_SOURCE=bids \
+		DATASET_ROOT=/media/tnzr/HDD11/Datasets/ds005873 \
+		ONLINE_AUG_PROB=0.95 \
+		PATIENT_SEQUENTIAL=1
 
-train-ecg-progression-ddp: ## Run ECG-first progression with DDP
-	$(MAKE) train-watch-eegnet-ddp
-	$(MAKE) train-watch-mobilenet-ddp
-	$(MAKE) train-watch-tcn-ddp
+train-patient-sequential-ddp: ## Train DDP with patient-by-patient sequential processing (BIDS dataset)
+	PATIENT_SEQUENTIAL=1 $(TORCHRUN) --nproc_per_node=$(NPROC) /home/tnzr/Documents/FIU/Research/Epilepsee-AI/scripts/train.py $(TRAIN_ARGS) \
+		--data-source bids \
+		--dataset-root /media/tnzr/HDD11/Datasets/ds005873 \
+		--strict-real-data \
+		--auto-threshold \
+		--threshold-objective $(THRESH_OBJECTIVE) \
+		--threshold-min-sensitivity $(THRESH_MIN_SENS) \
+		--threshold-max-fpr $(THRESH_MAX_FPR) \
+		--write-threshold-to-config \
+		--seed $(SEED) \
+		--patient-sequential \
+		--online-aug-prob 0.95
+
+train-safe-state-loss: ## Patient-sequential DDP with safe 3-class state loss (no GT countdown regression)
+	$(MAKE) train-patient-sequential-ddp \
+		STATE_LOSS=1 \
+		ONSET_THRESHOLD_MIN=$(ONSET_THRESHOLD_MIN)
+
+train-safe-state-loss-ring: ## State-loss DDP + ring-buffer temporal streaming (most deployment-realistic)
+	$(MAKE) train-safe-state-loss \
+		RING_BUFFER_SIZE=$(RING_BUFFER_SIZE)
 
 quantize: ## Quantize models/best_model.pt (override MODEL/Q_MODE)
 	$(PYTHON) scripts/quantize.py \

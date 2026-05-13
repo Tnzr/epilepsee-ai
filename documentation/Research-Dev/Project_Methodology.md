@@ -60,6 +60,46 @@ From your problem:
 
 ---
 
+## 1.3 Seizure Phase Terminology
+
+The following phases are used consistently throughout this document. They are defined on the **temporal axis** (clock time flowing forward), not on the numerical countdown label axis.
+
+| Phase | Definition | Countdown label $c$ |
+|---|---|---|
+| **Interictal** | Brain baseline state between seizures. No seizure trajectory is present. | $c < 0$ (annotated as −1; no upcoming seizure) |
+| **Pre-ictal** | Measurable physiological transition *toward* a seizure, minutes to tens of minutes before onset. The seizure has not started but the trajectory has begun. | $c \ge \theta$ (e.g., $c \ge 2$ min) |
+| **Onset** | The narrow window immediately preceding ictal discharge. Corresponds to the last 0–$\theta$ minutes of the pre-ictal ramp. | $0 \le c < \theta$ |
+| **Ictal** | The seizure itself. Not directly modeled as a separate head; onset merges into it at $c = 0$. | $c = 0$ |
+| **Post-ictal** | Recovery period. Falls back to interictal labeling once no further seizure is annotated. | $c < 0$ |
+
+> **Why countdown goes high → low, not low → high.** The label $c$ represents *minutes remaining until the next seizure*. As clock time advances toward a seizure, $c$ *decreases*: a sample recorded 20 min before a seizure has $c = 20$; a sample 1 min before has $c = 1$. Temporal order on the timeline is therefore:
+>
+> $$\underbrace{\text{interictal}}_{c < 0} \;\longrightarrow\; \underbrace{\text{pre-ictal}}_{c \ge \theta} \;\longrightarrow\; \underbrace{\text{onset}}_{0 \le c < \theta} \;\longrightarrow\; \text{seizure}$$
+>
+> Reading the same condition ranges numerically on the label axis instead gives $-1 \to 0{-}\theta \to \theta{+}$, which reverses the middle two states and suggests the incorrect order interictal → onset → pre-ictal. Always interpret the labels as a *countdown*, not a rank-ordered category index.
+
+---
+
+## 1.3 Seizure Phase Terminology
+
+The following phases are used consistently throughout this document. They are defined on the **temporal axis** (clock time flowing forward), not on the numerical countdown label axis.
+
+| Phase | Definition | Countdown label $c$ |
+|---|---|---|
+| **Interictal** | Brain baseline state between seizures. No seizure trajectory is present. | $c < 0$ (annotated as −1; no upcoming seizure) |
+| **Pre-ictal** | Measurable physiological transition *toward* a seizure, minutes to tens of minutes before onset. The seizure has not started but the trajectory has begun. | $c \ge \theta$ (e.g., $c \ge 2$ min) |
+| **Onset** | The narrow window immediately preceding ictal discharge. Corresponds to the last 0–$\theta$ minutes of the pre-ictal ramp. | $0 \le c < \theta$ |
+| **Ictal** | The seizure itself. Not directly modeled as a separate head; onset merges into it at $c = 0$. | $c = 0$ |
+| **Post-ictal** | Recovery period. Falls back to interictal labeling once no further seizure is annotated. | $c < 0$ |
+
+> **Why countdown goes high → low, not low → high.** The label $c$ represents *minutes remaining until the next seizure*. As clock time advances toward a seizure, $c$ *decreases*: a sample recorded 20 min before a seizure has $c = 20$; a sample 1 min before has $c = 1$. Temporal order on the timeline is therefore:
+>
+> $$\underbrace{\text{interictal}}_{c < 0} \;\longrightarrow\; \underbrace{\text{pre-ictal}}_{c \ge \theta} \;\longrightarrow\; \underbrace{\text{onset}}_{0 \le c < \theta} \;\longrightarrow\; \text{seizure}$$
+>
+> Reading the same condition ranges numerically on the label axis instead gives $-1 \to 0{-}\theta \to \theta{+}$, which reverses the middle two states. Always interpret the labels as a *countdown*, not a rank-ordered category index.
+
+---
+
 # 🔷 2. **Core Design Philosophy**
 
 The proposed system is based on three principles:
@@ -299,10 +339,40 @@ P(i → j)
 
 ## 4.2 Supervised Fine-Tuning
 
-### Loss:
+### Loss: SeizureStateLoss (3-class, no future-time regression)
+
+The training objective is a **safe state classification loss** that deliberately avoids regressing the exact countdown value in minutes. Regressing the countdown encodes *when* the next seizure will occur into model weights — a form of future data leakage that (a) is unverifiable at deployment, and (b) is self-defeating: a successful early intervention prevents the seizure, making the model's countdown prediction retrospectively "wrong" even though it triggered a correct response.
+
+Instead, GT countdown labels are used **only to bucket samples** into the three temporal states defined in §1.3:
+
+| Condition on $c$ | State | Target for each head |
+|---|---|---|
+| $c < 0$ | interictal | alert = 0, onset = 0 |
+| $c \ge \theta$ | pre-ictal | alert = 1, onset = 0 |
+| $0 \le c < \theta$ | onset | alert = 1, onset = 1 |
+
+The model has two output heads, both trained with Focal Binary Cross-Entropy:
 
 ```text
-L = L_current + λ L_future + γ L_aux
+L_alert = FocalBCE(pre_ictal_pred,  is_active)   # is_active = (c >= 0)
+L_onset = FocalBCE(sigmoid(countdown_pred), is_onset)  # is_onset = (0 <= c < θ)
+L_total = w_alert · L_alert + w_onset · L_onset
+```
+
+`pre_ictal_pred` learns **P(alert)** = P(pre-ictal OR onset). `countdown_pred` is **re-interpreted** as a logit for P(onset), not a regression target. No MSE, no ranking loss, no minutes-to-seizure value is ever forced into gradients.
+
+**Why P(alert) is still clinically meaningful without a countdown.** The model does not need to estimate *when* — it estimates *whether the brain is currently in a seizure-trajectory state*. The warning horizon is implicitly determined by:
+1. The feature window length (how many seconds of signal feed the encoder), and
+2. The pre-ictal period present in training data (typically 5–30 min for EEG-based datasets).
+
+When P(alert) rises above threshold, it means the signal pattern is statistically consistent with patterns observed during pre-ictal and onset periods in training. The guarantee required for safety is that **P(alert) is HIGH whenever onset is active** — which is satisfied structurally: `is_active` covers both pre-ictal and onset, so the alert head is always supervised to fire during onset.
+
+**Observer-effect self-consistency.** In a real-world alert system, a patient who receives an alert and takes rescue medication may stabilize before seizure onset, making a regression-based countdown provably wrong (it predicted $c = 4$ min but no seizure occurred). A state-based P(alert) has no such conflict: the prediction that "the brain was in a pre-ictal state" is independent of whether intervention succeeded.
+
+Auxiliary losses:
+
+```text
+L = L_alert + λ L_onset + γ L_aux
 ```
 
 ---
@@ -340,6 +410,74 @@ continuous stream → stepwise updates
 ✔ Preserves temporal continuity
 ✔ Matches real-world deployment
 ✔ Enables long-term reasoning
+
+---
+
+## 5.1 TemporalRingBufferDataset — Deployment-Faithful Training
+
+Conventional ML training shuffles the full dataset each epoch, exposing the model simultaneously to data from all points in a recording's history. A deployed wearable device has no such access: it only has the signal history *since the device was powered on*.
+
+To simulate this, `TemporalRingBufferDataset` wraps a time-sorted `SeizureDataset` and exposes only a sliding window of the most recent $W$ samples:
+
+```text
+Dataset (sorted chronologically):  [s_0, s_1, ..., s_{N-1}]
+                                              |
+                               offset         |      offset + W
+                                  v                       v
+                                  [  visible window W  ]
+```
+
+At each epoch the window advances by step $\Delta$:
+
+```text
+offset_e = min(N - W,  e * delta)
+```
+
+**Default step**: $\Delta = 0.10 \times W$ (10% of the buffer per epoch), so the entire dataset history is traversed over roughly 10 epochs.
+
+**Temporal continuity.** Because samples inside the window remain in chronological order and old samples are evicted as time advances, the model is never trained on a sample that would be "in the future" relative to the current window position. This enforces the same causal constraint the deployed device faces.
+
+**Integration with online augmentation.** Online augmentation (time-warp, amplitude-scale, Gaussian noise, time-shift) fires stochastically at the `SeizureDataset` level, inside the ring buffer's index translation. This means:
+- The same raw sample within the window appears with a different augmented form each epoch
+- Temporal ordering and dataset size are unchanged by augmentation
+- The small pre-ictal minority within the visible window still receives augmentation diversity despite the limited window size
+- Newly entered samples begin receiving augmentation immediately with no configuration change
+
+**Patient-sequential training with ring buffer.** When combined with patient-sequential splitting (one patient's full recording timeline forms the training stream), the ring buffer prevents the model from seeing a future patient's data while processing an earlier patient — faithfully simulating a clinical streaming device that processes patients in sequence, never with hindsight.
+
+---
+
+## 5.1 TemporalRingBufferDataset — Deployment-Faithful Training
+
+Conventional ML training shuffles the full dataset each epoch, exposing the model simultaneously to data from all times in a recording. A deployed wearable device has no such luxury: it only has access to the signal history *since the device was turned on*.
+
+To simulate this, the `TemporalRingBufferDataset` wraps a time-sorted dataset and exposes only a sliding window of the most recent $W$ samples:
+
+```text
+Dataset (sorted chronologically):  [s_0, s_1, ..., s_{N-1}]
+                                           ↑            ↑
+                                        offset    offset + W
+                                      └──────────────────┘
+                                           visible window
+```
+
+At each epoch the window advances by a step $\Delta$:
+
+```text
+offset_e = min(N - W,  e · Δ)
+```
+
+**Default step**: $\Delta = 0.10 \times W$ (10% of the buffer per epoch), so the full dataset is traversed in approximately 10 epochs.
+
+**Why this matters for longitudinal time series.** Seizure data is inherently temporal. An LSTM or GRU trained on random shuffles of full-history windows will develop spurious correlations with samples that, in deployment, the device has not yet seen. The ring buffer enforces the same constraint the device faces: the model can only learn from signal history that precedes the current moment in recording time.
+
+**Integration with online augmentation.** Online augmentation (time-warp, amplitude-scale, Gaussian noise, time-shift) fires stochastically at the `SeizureDataset` level, *inside* the ring buffer's index translation. This means:
+- The same raw sample within the window appears with a different augmented form each epoch
+- Temporal ordering and dataset size are both unchanged
+- The small pre-ictal minority within the visible window still receives augmentation diversity despite the limited window size
+- As the window advances and new samples enter the buffer, they begin receiving augmentation immediately with no configuration change
+
+**Patient-sequential training with ring buffer.** When combined with patient-sequential splitting (one patient's full recording timeline forms the training stream), the ring buffer further prevents the model from seeing a future patient's data while processing an earlier patient — faithfully simulating a streaming clinical device that processes patients in sequence, never with hindsight.
 
 ---
 
@@ -603,13 +741,12 @@ To move from current window-centric training to deployment-faithful behavior, us
 
 ## 15.1 Final Output Definition
 
-At each inference step $t$ (for example every 1 second), the model must output:
+At each inference step $t$ (for example every 1 second), the model outputs:
 
 ```text
 o_t = {
-  p_preictal(t),
-  p_interictal(t),
-  t_seizure_hat(t),
+  p_alert(t),
+  p_onset(t),
   uncertainty(t),
   evidence_tokens(t)
 }
@@ -617,10 +754,17 @@ o_t = {
 
 Where:
 
-* $p_preictal(t)$ = probability of seizure risk state
-* $t_seizure_hat(t)$ = estimated time-to-seizure (seconds or minutes)
-* $uncertainty(t)$ = calibrated confidence interval
+* $p_{\text{alert}}(t)$ = P(brain is in a pre-ictal or onset state right now). Fires the alert when above threshold. Corresponds to `pre_ictal_pred` head.
+* $p_{\text{onset}}(t)$ = P(seizure is imminent, within the onset window $\theta$ minutes). Secondary "red alert" flag. Corresponds to `sigmoid(countdown_pred)` head.
+* $uncertainty(t)$ = calibrated confidence interval (Monte-Carlo dropout or ensemble variance)
 * $evidence_tokens(t)$ = dominant token IDs and transition motifs supporting the estimate
+
+> **Note: no $\hat{t}_{\text{seizure}}$ output.** The model intentionally does not estimate time-to-seizure in minutes. Reasons:
+> 1. **Observer effect**: a correct alert that triggers successful intervention will suppress the seizure, making a minutes-based countdown retrospectively wrong.
+> 2. **Future data leakage**: training a regression head on countdown minutes forces the gradient to encode absolute future timing into weights — information unavailable at deployment without a perfect oracle.
+> 3. **State vs. time**: the clinically actionable quantity is *whether* a seizure trajectory is active, not *exactly when*. P(alert) answers the actionable question; $\hat{t}$ pretends a level of precision the signal does not support.
+>
+> The warning horizon is implicitly defined by the pre-ictal period length in training data and the feature window size, not by a regression output.
 
 ## 15.2 Continuous Training Sweep
 
@@ -659,7 +803,18 @@ The current pipeline now includes a recording-aware chronological Bayesian memor
 Per step $t$ (within each recording):
 
 ```text
-token_t = discretize(pred_preictal_t, pred_countdown_t)
+token_t = discretize(p_alert_t, p_onset_t)
+```
+
+The two heads `p_alert` and `p_onset` define a 2D prediction space. Because both are independently supervised (alert covers pre-ictal + onset; onset is a narrower positive class), their joint value varies across all three states — producing far richer token diversity than a single countdown scalar:
+
+| State | p_alert | p_onset | Typical token region |
+|---|---|---|---|
+| interictal | low | low | bottom-left cluster |
+| pre-ictal | high | low | top-left cluster |
+| onset | high | high | top-right cluster |
+
+```text
 c_t = rho * c_{t-1} + one_hot(token_t)
 A_t = rho * A_{t-1}; A_t(token_{t-1}, token_t) += 1
 ```
