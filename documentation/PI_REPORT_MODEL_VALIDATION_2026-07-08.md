@@ -6,6 +6,21 @@
 
 ---
 
+## ⚠️ CRITICAL: Training-Deployment Mismatch Discovered
+
+**IMPORTANT CONTEXT FOR THIS REPORT:**
+
+This model was trained using **random shuffled batches with independent hidden states per batch**, but will be deployed using **continuous sequential inference with accumulated hidden state**. This fundamental incompatibility means:
+
+1. **Current Model Status:** Acts as a stateless 16-minute window classifier
+2. **Deployment Need:** Requires stateful temporal accumulation across hours/days  
+3. **This Report:** Documents preliminary results from methodology mismatch
+4. **Next Action:** Retrain with **stateful LSTM** (patient-sequential batching)
+
+**See:** [TRAINING_METHODOLOGY_GUARD.md](../TRAINING_METHODOLOGY_GUARD.md) for full analysis.
+
+---
+
 ## ⚠️ Critical Methodological Note
 
 This model is **sequence-dependent** (LSTM-based). Validation must respect temporal continuity:
@@ -13,6 +28,8 @@ This model is **sequence-dependent** (LSTM-based). Validation must respect tempo
 - ✅ **Right:** Start from beginning of patient data, run inference continuously forward in time
 
 **Why:** LSTM hidden state encodes all prior observations. Testing on isolated windows breaks the dependency chain and produces misleading results. The model must be deployed as it will run in production: starting at patient enrollment and maintaining continuous temporal context.
+
+**Additional Context:** Current training methodology (random shuffling) was not aligned with this deployment requirement. Retraining with stateful LSTM is underway to ensure training ↔ deployment consistency.
 
 ---
 
@@ -228,7 +245,7 @@ python scripts/ultra_long_inference_stability.py \
 
 | File | Purpose |
 |------|---------|
-| `models/epoch_016_gt_vs_inference_panel.png` | Current best inference visualization (⚠️ see Issue 1 re: elevated alarm) |
+| `models/epoch_016_gt_vs_inference_panel.png` | **[PLACEHOLDER]** Current best inference visualization from random-shuffled training (⚠️ see Issue 1 re: elevated alarm). Will be replaced after stateful LSTM retraining. |
 | `models/COMPREHENSIVE_RUN_REPORT.md` | Full test metrics, per-patient breakdown |
 | `INFERENCE_COLLAPSE_FIX_REPORT.md` | Technical deep-dive on root cause and fix |
 | `config/default_config.yaml` | Live configuration (all fixes applied) |

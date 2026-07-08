@@ -1,0 +1,210 @@
+# Stateful LSTM Configuration for Seizure Anticipation
+# Based on default_config.yaml with stateful-specific enhancements
+
+experiment_name: "seizure_anticipation_stateful_lstm"
+description: "ECG-only LSTM model with stateful training (patient-sequential batching, temporal continuity)"
+tags:
+  - stateful-lstm
+  - ecg-only
+  - patient-sequential
+  - temporal-continuity
+
+# Data configuration
+data:
+  dataset_root: "/mnt/d/Datasets/SeizeIT2"  # ← SeizeIT2 (not wearable)
+  output_dir: "./data"
+  
+  sampling_rate_high: 250
+  sampling_rate_motion: 25
+  
+  ecg_lowcut: 0.5
+  ecg_highcut: 40.0
+  motion_threshold: 1.0
+  
+  feature_window_s: 60.0
+  feature_step_s: 1.0
+  pre_ictal_window_s: 1800.0
+  
+  train_ratio: 0.60
+  val_ratio: 0.15
+  test_ratio: 0.25
+  
+  cv_strategy: "patient_stratified"  # ← Stratified by patient (not random)
+  random_seed: 42
+  
+  max_wearable_global_samples: 50000
+  max_wearable_nonseizure_recordings: 40
+
+# Model configuration
+model:
+  model_type: "ecg_lstm"  # ecg_lstm, cnn_lstm, or multimodal
+  coherent_heads: true     # Connect classification to regression head
+  
+  ecg_feature_dim: 14
+  eeg_feature_dim: 6
+  motion_feature_dim: 2
+  
+  hidden_dim: 128
+  num_lstm_layers: 2
+  bidirectional: true
+  
+  use_attention: true
+  num_attention_heads: 4
+  
+  dropout: 0.3
+  use_batch_norm: true
+  
+  output_countdown_max: 10.0
+  init_method: "xavier"
+
+# Loss configuration
+loss:
+  classification_weight: 1.0
+  regression_weight: 1.0
+  ranking_weight: 0.0
+  
+  regression_loss: "weighted_mse"
+  weight_tau: 100.0
+  label_smoothing: 0.05
+  
+  # Classification loss: "bce" enables class weighting
+  classification_loss_type: "bce"
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  
+  # Class weighting tuned to dataset imbalance (9.4:1, boosted to 15)
+  use_class_weighting: true
+  classification_positive_weight: 15.0
+
+# Training configuration
+training:
+  # ===== NEW: Training mode specification =====
+  training_mode: "stateful"  # "stateful" or "stateless"
+  batching_strategy: "patient_sequential"  # "patient_sequential" or "random"
+  
+  # ===== NEW: Stateful LSTM parameters =====
+  stateful_lstm:
+    enabled: true
+    hidden_state_detach_interval: 10  # Detach hidden state every 10 batches within patient
+    max_patient_sequence_length: 10000  # Warn if patient data exceeds this
+    reset_hidden_between_epochs: false  # Don't reset between epochs
+  
+  # ===== Existing parameters =====
+  optimizer: "adam"
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  momentum: 0.9
+  
+  lr_scheduler: "reduce_on_plateau"
+  lr_factor: 0.5
+  lr_patience: 10
+  lr_min: 0.000001
+  
+  batch_size: 32
+  num_epochs: 16
+  
+  num_workers: 4
+  pin_memory: true
+  
+  gradient_clip_norm: 1.0
+  gradient_clip_value: null
+  
+  log_interval: 100
+  save_interval: 1
+  validation_interval: 1
+  
+  # Distributed training (for multi-GPU)
+  distributed: false
+  world_size: 1
+  rank: 0
+  backend: "nccl"
+  master_addr: "localhost"
+  master_port: 29503
+
+# Validation configuration
+validation:
+  # IMPORTANT: Stateful models must use continuous inference validation
+  # NOT random window sampling
+  validation_mode: "longitudinal_continuous"  # Not "random_windows"
+  
+  # Generate continuous inference traces for these patients
+  # Example: ["sub-001", "sub-002", "sub-005"]
+  validation_patients: []  # Auto-select 5-10 patients with seizures if empty
+  
+  # Metrics to track
+  metrics:
+    - "advance_warning_time"
+    - "false_alarm_rate"
+    - "detection_rate"
+    - "hidden_state_drift"
+
+# Deployment configuration
+deployment:
+  # Target edge device
+  device: "wearable"  # "wearable", "smartwatch", "edge_server"
+  
+  # Quantization
+  quantize: false
+  quantization_type: "int8"  # "int8" or "float16"
+  
+  # Latency requirement (ms)
+  target_latency_ms: 100
+  
+  # Memory requirement (MB)
+  target_memory_mb: 50
+
+# Checkpointing and resumption
+checkpoint:
+  save_best: true
+  save_last: true
+  resume_from: null  # Set to checkpoint path to resume training
+  
+  # Location of checkpoints
+  checkpoint_dir: "./models/stateful_v1"
+
+# Logging and monitoring
+logging:
+  log_level: "INFO"
+  log_dir: "./logs/stateful_v1"
+  
+  # TensorBoard logging
+  use_tensorboard: true
+  tensorboard_dir: "./runs/stateful_v1"
+  
+  # Wandb logging (optional)
+  use_wandb: false
+  wandb_project: "seizure-anticipation"
+  wandb_entity: null
+
+# ===== CRITICAL NOTES FOR STATEFUL TRAINING =====
+# 
+# 1. TEMPORAL CONTINUITY:
+#    - Training uses patient-sequential batching (not random shuffling)
+#    - Hidden state is maintained across batches within a patient
+#    - Hidden state is reset when a new patient starts
+#    - This EXACTLY mirrors deployment behavior (continuous inference)
+#
+# 2. VALIDATION METHODOLOGY:
+#    - Do NOT use random ±30 min windows (breaks temporal continuity)
+#    - Use continuous longitudinal inference from patient data start
+#    - Validation must respect the same temporal dependency as training
+#
+# 3. KEY DIFFERENCES FROM RANDOM-SHUFFLED TRAINING:
+#    - OLD: Random batches (any 32 samples from any patients)
+#           → Model learned stateless 16-min window classifier
+#    - NEW: Patient-sequential batches (32 consecutive samples from one patient)
+#           → Model learns temporal patterns with accumulated context
+#
+# 4. EXPECTED IMPROVEMENTS:
+#    - Prediction variance increases (more diverse predictions)
+#    - Temporal patterns emerge in heatmaps (colorful, not monochrome)
+#    - Token activation shows multi-channel patterns (not all-black)
+#    - Classification metrics balanced (no 100% dominant class)
+#
+# 5. HIDDEN STATE MANAGEMENT:
+#    - detach_interval=10: Detach every 10 batches (~5 minutes of context)
+#    - This prevents backprop explosion while allowing gradient flow
+#    - Equivalent to truncated BPTT (backprop through time)
+#
+# See TRAINING_METHODOLOGY_GUARD.md for prevention guide
+# See STATEFUL_LSTM_TRAINING_DESIGN.md for architecture details

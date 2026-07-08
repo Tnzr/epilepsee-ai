@@ -90,9 +90,11 @@ class ECGCountdownPredictor(nn.Module):
             nn.Sigmoid()
         )
         
-        # Regression head (countdown)
+        # If using coherent heads, regression head takes pooled + class pre-activation
+        self.coherent_heads = getattr(config, 'coherent_heads', False)
+        regress_in_dim = lstm_output_dim + (1 if self.coherent_heads else 0)
         self.fc_regress = nn.Sequential(
-            nn.Linear(lstm_output_dim, 64),
+            nn.Linear(regress_in_dim, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 1)
@@ -114,17 +116,24 @@ class ECGCountdownPredictor(nn.Module):
                     elif 'bias' in name:
                         nn.init.zeros_(param)
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
+    def forward(self, x: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) \
+            -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Forward pass with optional stateful LSTM.
         
         Args:
             x: (batch, time_steps, features)
+            hidden_state: Optional (h, c) tuple for stateful LSTM. If None, initialize fresh.
+                         Used for maintaining temporal context across batches in training.
         
         Returns:
-            Tuple of (pre_ictal_prob, countdown_minutes)
+            Tuple of (pre_ictal_prob, countdown_minutes, hidden_state)
+            - For backward compatibility, hidden_state is only returned if requested
         """
-        # LSTM
-        lstm_out, (h_n, c_n) = self.lstm(x)  # (batch, time, hidden*2)
+        # LSTM with optional hidden state
+        if hidden_state is None:
+            lstm_out, (h_n, c_n) = self.lstm(x)  # (batch, time, hidden*2)
+        else:
+            lstm_out, (h_n, c_n) = self.lstm(x, hidden_state)  # (batch, time, hidden*2)
         
         # Attention
         if self.attention is not None:
@@ -136,13 +145,21 @@ class ECGCountdownPredictor(nn.Module):
             pooled = lstm_out[:, -1, :]  # (batch, hidden*2)
         
         # Classification head
-        pre_ictal_prob = self.fc_class(pooled)  # (batch, 1)
-        
-        # Regression head (smoothly bounded to [0, max] to avoid clamp saturation)
-        countdown = self.fc_regress(pooled)  # (batch, 1)
+        pre_ictal_prob = self.fc_class[0](pooled)
+        pre_ictal_prob = self.fc_class[1](pre_ictal_prob)
+        pre_ictal_prob = self.fc_class[2](pre_ictal_prob)
+        pre_ictal_logits = self.fc_class[3](pre_ictal_prob)  # (batch, 1) before sigmoid
+        pre_ictal_prob = self.fc_class[4](pre_ictal_logits)  # sigmoid
+
+        # Regression head (optionally receives class pre-activation)
+        if self.coherent_heads:
+            regress_input = torch.cat([pooled, pre_ictal_logits], dim=-1)
+        else:
+            regress_input = pooled
+        countdown = self.fc_regress(regress_input)  # (batch, 1)
         countdown = torch.sigmoid(countdown) * self.config.output_countdown_max
-        
-        return pre_ictal_prob.squeeze(-1), countdown.squeeze(-1)
+
+        return pre_ictal_prob.squeeze(-1), countdown.squeeze(-1), (h_n, c_n)
 
 
 class CNNLSTMCountdown(nn.Module):
@@ -466,13 +483,16 @@ class TCNCountdown(nn.Module):
         self.tcn = nn.Sequential(*blocks)
 
         final_ch = num_channels[-1]
+        self.coherent_heads = getattr(config, 'coherent_heads', False)
 
-        self.fc_class = nn.Sequential(
-            nn.Linear(final_ch, 64), nn.ReLU(),
-            nn.Dropout(dropout), nn.Linear(64, 1), nn.Sigmoid()
+        self.fc_class_hidden = nn.Sequential(
+            nn.Linear(final_ch, 64), nn.ReLU(), nn.Dropout(dropout)
         )
+        self.fc_class_out = nn.Linear(64, 1)
+
+        regress_in_dim = final_ch + (1 if self.coherent_heads else 0)
         self.fc_regress = nn.Sequential(
-            nn.Linear(final_ch, 64), nn.ReLU(),
+            nn.Linear(regress_in_dim, 64), nn.ReLU(),
             nn.Dropout(dropout), nn.Linear(64, 1)
         )
 
@@ -482,8 +502,12 @@ class TCNCountdown(nn.Module):
         x = self.tcn(x)                # → (batch, channels, time)
         pooled = x.mean(dim=-1)        # global average pool → (batch, channels)
 
-        pre_ictal_prob = self.fc_class(pooled)
-        countdown = self.fc_regress(pooled)
+        class_hidden = self.fc_class_hidden(pooled)
+        pre_ictal_logits = self.fc_class_out(class_hidden)
+        pre_ictal_prob = torch.sigmoid(pre_ictal_logits)
+
+        regress_input = torch.cat([pooled, pre_ictal_logits], dim=-1) if self.coherent_heads else pooled
+        countdown = self.fc_regress(regress_input)
         countdown = torch.sigmoid(countdown) * self.config.output_countdown_max
         return pre_ictal_prob.squeeze(-1), countdown.squeeze(-1)
 
@@ -714,13 +738,16 @@ class InceptionTime1DCountdown(nn.Module):
         self.gap = nn.AdaptiveAvgPool1d(1)
         self.drop = nn.Dropout(dropout)
         final_ch = self.inception_blocks[-1].out_channels  # type: ignore[attr-defined]
+        self.coherent_heads = getattr(config, 'coherent_heads', False)
 
-        self.fc_class = nn.Sequential(
-            nn.Linear(final_ch, 64), nn.ReLU(),
-            nn.Dropout(dropout), nn.Linear(64, 1), nn.Sigmoid()
+        self.fc_class_hidden = nn.Sequential(
+            nn.Linear(final_ch, 64), nn.ReLU(), nn.Dropout(dropout)
         )
+        self.fc_class_out = nn.Linear(64, 1)
+
+        regress_in_dim = final_ch + (1 if self.coherent_heads else 0)
         self.fc_regress = nn.Sequential(
-            nn.Linear(final_ch, 64), nn.ReLU(),
+            nn.Linear(regress_in_dim, 64), nn.ReLU(),
             nn.Dropout(dropout), nn.Linear(64, 1)
         )
 
@@ -736,8 +763,12 @@ class InceptionTime1DCountdown(nn.Module):
         x = self.gap(x).squeeze(-1)
         x = self.drop(x)
 
-        pre_ictal_prob = self.fc_class(x)
-        countdown = torch.sigmoid(self.fc_regress(x)) * self.config.output_countdown_max
+        class_hidden = self.fc_class_hidden(x)
+        pre_ictal_logits = self.fc_class_out(class_hidden)
+        pre_ictal_prob = torch.sigmoid(pre_ictal_logits)
+
+        regress_input = torch.cat([x, pre_ictal_logits], dim=-1) if self.coherent_heads else x
+        countdown = torch.sigmoid(self.fc_regress(regress_input)) * self.config.output_countdown_max
         return pre_ictal_prob.squeeze(-1), countdown.squeeze(-1)
 
 
@@ -799,13 +830,16 @@ class TemporalTransformerCountdown(nn.Module):
             encoder_layer, num_layers=num_layers,
             norm=nn.LayerNorm(d_model)
         )
+        self.coherent_heads = getattr(config, 'coherent_heads', False)
 
-        self.fc_class = nn.Sequential(
-            nn.Linear(d_model, 64), nn.ReLU(),
-            nn.Dropout(dropout), nn.Linear(64, 1), nn.Sigmoid()
+        self.fc_class_hidden = nn.Sequential(
+            nn.Linear(d_model, 64), nn.ReLU(), nn.Dropout(dropout)
         )
+        self.fc_class_out = nn.Linear(64, 1)
+
+        regress_in_dim = d_model + (1 if self.coherent_heads else 0)
         self.fc_regress = nn.Sequential(
-            nn.Linear(d_model, 64), nn.ReLU(),
+            nn.Linear(regress_in_dim, 64), nn.ReLU(),
             nn.Dropout(dropout), nn.Linear(64, 1)
         )
 
@@ -816,8 +850,12 @@ class TemporalTransformerCountdown(nn.Module):
         x = self.transformer(x)    # → (batch, time, d_model)
         pooled = x.mean(dim=1)     # global average pool over time
 
-        pre_ictal_prob = self.fc_class(pooled)
-        countdown = torch.sigmoid(self.fc_regress(pooled)) * self.config.output_countdown_max
+        class_hidden = self.fc_class_hidden(pooled)
+        pre_ictal_logits = self.fc_class_out(class_hidden)
+        pre_ictal_prob = torch.sigmoid(pre_ictal_logits)
+
+        regress_input = torch.cat([pooled, pre_ictal_logits], dim=-1) if self.coherent_heads else pooled
+        countdown = torch.sigmoid(self.fc_regress(regress_input)) * self.config.output_countdown_max
         return pre_ictal_prob.squeeze(-1), countdown.squeeze(-1)
 
 
