@@ -9,7 +9,7 @@ tags:
 
 # Data configuration
 data:
-  dataset_root: "${BIDS_DATASET_ROOT:/path/to/datasets/ds005873}"
+  dataset_root: "/mnt/d/Datasets/WearablwDevice-Oregon"
   output_dir: "./data"
   
   sampling_rate_high: 250
@@ -47,6 +47,8 @@ data:
 # Model configuration
 model:
   model_type: "ecg_lstm"  # ecg_lstm, cnn_lstm, or multimodal
+  coherent_heads: true     # If true, connect classification to regression head (UNet-style)
+  # patient_id: "002"        # Only use this patient if set (Oregon dataset)
   
   ecg_feature_dim: 14
   eeg_feature_dim: 6
@@ -67,23 +69,22 @@ model:
 
 # Loss configuration
 loss:
-  classification_weight: 0.3
-  regression_weight: 0.7
+  classification_weight: 1.0
+  regression_weight: 1.0
   ranking_weight: 0.0
   
   regression_loss: "weighted_mse"
-  weight_tau: 60.0
-  label_smoothing: 0.0
+  weight_tau: 100.0
+  label_smoothing: 0.05
   # Classification loss: "bce" (default) or "focal".
+  # Use BCE to properly apply pos_weight class weighting
   classification_loss_type: "bce"
   focal_alpha: 0.25
   focal_gamma: 2.0
-  # For highly imbalanced wearable runs we rely on temporal weighting
-  # and augmentation rather than very large BCE class weights, which
-  # can destabilize training. Class weighting can be re-enabled in a
-  # custom config if needed.
-  use_class_weighting: false
-  classification_positive_weight: null
+  # Class weighting: pos_weight = interictal_count / preictal_count
+  # Ratio: 7812 / 828 = 9.43 (slightly boosted to 15 for better signal learning)
+  use_class_weighting: true
+  classification_positive_weight: 15.0
 
 # Training configuration
 training:
@@ -107,6 +108,7 @@ training:
   use_weighted_sampling: false
   long_sweep_training: false
   epoch_panel_window_minutes: 180.0
+  epoch_panel_preferred_recording: "sub-002"  # Always use patient 2 for epoch panel visualizations
   
   early_stopping: true
   early_stopping_patience: 15

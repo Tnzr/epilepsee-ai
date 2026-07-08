@@ -14,17 +14,61 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import importlib
 from matplotlib.gridspec import GridSpec
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict
 import logging
 from sklearn.metrics import confusion_matrix
 
-try:
-    import wandb
-    HAS_WANDB = True
-except ImportError:
-    HAS_WANDB = False
+def _import_wandb_safely():
+    """Import real wandb package even when local ./wandb folder shadows it."""
+    try:
+        import wandb as _wandb
+        if hasattr(_wandb, 'init') and hasattr(_wandb, 'Image'):
+            return _wandb, True
+    except Exception:
+        pass
+
+    try:
+        import os
+        import sys
+        import site
+
+        repo_root = str(Path(__file__).resolve().parents[1])
+        blocked = {
+            '',
+            os.getcwd(),
+            repo_root,
+        }
+
+        orig_path = list(sys.path)
+        try:
+            sys.modules.pop('wandb', None)
+            clean_path = [
+                p for p in sys.path
+                if str(Path(p).resolve()) not in {str(Path(x).resolve()) for x in blocked if x}
+            ]
+            for sp in site.getsitepackages():
+                if sp not in clean_path:
+                    clean_path.insert(0, sp)
+            user_site = site.getusersitepackages()
+            if user_site and user_site not in clean_path:
+                clean_path.insert(0, user_site)
+
+            sys.path = clean_path
+            _wandb = importlib.import_module('wandb')
+            if hasattr(_wandb, 'init') and hasattr(_wandb, 'Image'):
+                return _wandb, True
+        finally:
+            sys.path = orig_path
+    except Exception:
+        pass
+
+    return None, False
+
+
+wandb, HAS_WANDB = _import_wandb_safely()
 
 
 logger = logging.getLogger(__name__)
@@ -323,6 +367,8 @@ class SignalVisualizer:
                                    ppg_signal: Optional[np.ndarray] = None,
                                    eda_signal: Optional[np.ndarray] = None,
                                    eeg_signal: Optional[np.ndarray] = None,
+                                   emg_signal: Optional[np.ndarray] = None,
+                                   mov_signal: Optional[np.ndarray] = None,
                                    adxl_series: Optional[np.ndarray] = None,
                                    pred_preictal_smooth: Optional[np.ndarray] = None,
                                    train_cm_true_preictal: Optional[np.ndarray] = None,
@@ -341,7 +387,14 @@ class SignalVisualizer:
                                    gt_onset: Optional[np.ndarray] = None,
                                    gt_preictal_only: Optional[np.ndarray] = None,
                                    visualization_mode: str = 'countdown',
-                                   figsize: Tuple[int, int] = (12, 9)) -> plt.Figure:
+                                   figsize: Tuple[int, int] = (12, 9),
+                                   token_roll: Optional[np.ndarray] = None,
+                                   token_window: Optional[int] = None,
+                                   token_vmax: float = 1.0,
+                                   token_labels: Optional[List[str]] = None,
+                                   local_accuracy: Optional[np.ndarray] = None,
+                                   gt_event_mask: Optional[np.ndarray] = None,
+                                   data_source: str = 'bids') -> plt.Figure:
         """Create panel with multimodal traces, ADXL+HRV, optional EEG subplot, and inference.
 
         Layout (left column):
@@ -359,27 +412,44 @@ class SignalVisualizer:
         gt_preictal = (true_countdown >= 0).astype(int)
         gt_onset = np.asarray(gt_onset, dtype=np.int32) if gt_onset is not None and len(gt_onset) == n_samples else np.zeros(n_samples, dtype=np.int32)
         gt_preictal_only = np.asarray(gt_preictal_only, dtype=np.int32) if gt_preictal_only is not None and len(gt_preictal_only) == n_samples else np.maximum(gt_preictal - gt_onset, 0)
+        if gt_event_mask is not None and len(gt_event_mask) == n_samples:
+            gt_events = (np.asarray(gt_event_mask, dtype=np.int32) > 0).astype(np.int32)
+        else:
+            gt_events = np.zeros(n_samples, dtype=np.int32)
+            if n_samples > 0:
+                gt_events[0] = int(gt_preictal[0] > 0)
+            if n_samples > 1:
+                gt_events[1:] = ((gt_preictal[1:] > 0) & (gt_preictal[:-1] <= 0)).astype(np.int32)
+
+        local_acc = (
+            np.clip(np.asarray(local_accuracy, dtype=np.float32), 0.0, 1.0)
+            if local_accuracy is not None and len(local_accuracy) == n_samples
+            else None
+        )
         pred_onset_prob = np.asarray(pred_onset_prob, dtype=np.float32) if pred_onset_prob is not None and len(pred_onset_prob) == n_samples else None
         pred_preictal_only_prob = np.asarray(pred_preictal_only_prob, dtype=np.float32) if pred_preictal_only_prob is not None and len(pred_preictal_only_prob) == n_samples else None
         state_mode = str(visualization_mode).lower() == 'state' and pred_onset_prob is not None and pred_preictal_only_prob is not None
         pred_binary = (pred_preictal_prob >= detection_threshold).astype(int)
 
         has_eeg = eeg_signal is not None and len(eeg_signal) == n_samples
-        n_left_rows = 5 if has_eeg else 4
-        fig_h = figsize[1] + (2 if has_eeg else 0)
+        add_token_row = token_roll is not None
+        n_left_rows = (5 if has_eeg else 4) + (1 if add_token_row else 0)
+        fig_h = figsize[1] + (2 if has_eeg else 0) + (2 if add_token_row else 0)
 
         fig = plt.figure(figsize=(figsize[0], fig_h), constrained_layout=True)
-        panel_title = 'GT vs Inference Panel (PPG/EDA | ADXL/HRV | EEG | Alarm | Heatmap)'
+        panel_title = 'GT vs Inference Panel (ECG/BPM | EMG/MOV/HRV | EEG | Heads | Heatmap)'
         if title_prefix:
             panel_title = f'{title_prefix} | {panel_title}'
         fig.suptitle(panel_title, fontsize=11, fontweight='bold')
-        grid = GridSpec(n_left_rows, 2, figure=fig, width_ratios=[3.0, 1.35], hspace=0.18, wspace=0.15)
+        # Removed right-column confusion matrix; using single column for better heatmap visibility
+        grid = GridSpec(n_left_rows, 1, figure=fig, width_ratios=[1.0], hspace=0.18, wspace=0.15)
 
         # Row indices — shift alarm/heatmap down by 1 when EEG subplot is present
         row_adxl   = 1
         row_eeg    = 2 if has_eeg else None
         row_alarm  = 3 if has_eeg else 2
         row_heat   = 4 if has_eeg else 3
+        row_token  = n_left_rows - 1 if add_token_row else None
 
         # ── Left-1: PPG + EDA overlay ──────────────────────────────────────────
         ax_signal = fig.add_subplot(grid[0, 0])
@@ -391,72 +461,194 @@ class SignalVisualizer:
                 return np.zeros_like(sig, dtype=np.float32)
             return (sig - s_min) / (s_max - s_min + 1e-8)
 
-        primary_signal = ppg_signal if ppg_signal is not None and len(ppg_signal) == len(ecg_signal) else ecg_signal
-        ax_signal.plot(x_minutes, _normalize_signal(primary_signal), color='black',
-                       linewidth=1.2, alpha=0.85, label=f'{signal_label} (norm)')
+        def _contrast_scale(sig: np.ndarray) -> np.ndarray:
+            arr = np.asarray(sig, dtype=np.float32)
+            if arr.size == 0:
+                return arr
+            lo = float(np.nanpercentile(arr, 5.0))
+            hi = float(np.nanpercentile(arr, 95.0))
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo + 1e-8:
+                lo = float(np.nanmin(arr))
+                hi = float(np.nanmax(arr))
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo + 1e-8:
+                return np.zeros_like(arr, dtype=np.float32)
+            return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
 
-        if eda_signal is not None and len(eda_signal) == len(primary_signal):
-            ax_signal.plot(x_minutes, _normalize_signal(eda_signal), color='seagreen',
-                           linewidth=1.0, alpha=0.75, label='EDA proxy (norm)')
+        # Use explicit data_source from caller; avoid call-stack heuristics that can
+        # misclassify runs and apply the wrong y-axis semantics.
+        is_wearable = str(data_source).lower() == 'wearable'
 
-        y_min, y_max = 0.0, 1.0
-        ax_signal.fill_between(x_minutes, y_min, y_max, where=gt_preictal > 0,
+        if is_wearable and hr_series is not None and (eda_signal is not None and len(eda_signal) == len(hr_series)):
+            # Plot wearable HR only when enough samples are physiologically plausible.
+            hr_arr = np.asarray(hr_series, dtype=np.float32)
+            finite = np.isfinite(hr_arr)
+            plausible = finite & (hr_arr >= 20.0) & (hr_arr <= 240.0)
+            plausible_ratio = float(np.mean(plausible)) if hr_arr.size > 0 else 0.0
+            if plausible_ratio >= 0.2:
+                hr_plot = np.where(plausible, hr_arr, np.nan)
+            else:
+                logger.warning('Skipping wearable HR overlay: insufficient plausible BPM samples in panel (ratio=%.2f)', plausible_ratio)
+                hr_plot = np.full_like(hr_arr, np.nan, dtype=np.float32)
+
+            ax_signal.plot(x_minutes, hr_plot, color='black',
+                           linewidth=1.2, alpha=0.85, label='HR (bpm)')
+            ax_signal.set_ylabel('HR (bpm)', fontsize=9, color='black')
+            ax_signal.tick_params(axis='y', labelcolor='black')
+            ax_signal2 = ax_signal.twinx()
+            ax_signal2.plot(x_minutes, eda_signal, color='seagreen',
+                            linewidth=1.0, alpha=0.75, label='EDA (raw)')
+            ax_signal2.set_ylabel('EDA (raw)', fontsize=9, color='seagreen')
+            ax_signal2.tick_params(axis='y', labelcolor='seagreen')
+            # Add legends for both axes
+            lines1, labels1 = ax_signal.get_legend_handles_labels()
+            lines2, labels2 = ax_signal2.get_legend_handles_labels()
+            ax_signal.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
+            if np.any(np.isfinite(hr_plot)):
+                p1 = float(np.nanpercentile(hr_plot, 1.0))
+                p99 = float(np.nanpercentile(hr_plot, 99.0))
+                y_lo = max(20.0, p1 - 5.0)
+                y_hi = min(220.0, max(y_lo + 10.0, p99 + 5.0))
+                ax_signal.set_ylim(y_lo, y_hi)
+            ax_signal2.set_ylim(np.nanmin(eda_signal), np.nanmax(eda_signal))
+        else:
+            # Non-wearable (BIDS): always prioritize raw ECG amplitude as the
+            # primary trace and overlay BPM on a secondary axis to avoid
+            # ambiguity between raw signal and processed heart-rate trends.
+            primary_signal = np.asarray(ecg_signal, dtype=np.float32)
+            finite_primary = np.isfinite(primary_signal)
+            if np.any(finite_primary):
+                centered = primary_signal - float(np.nanmedian(primary_signal[finite_primary]))
+                lo = float(np.nanpercentile(centered[finite_primary], 1.0))
+                hi = float(np.nanpercentile(centered[finite_primary], 99.0))
+                if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) < 1e-6:
+                    spread = float(np.nanstd(centered[finite_primary]))
+                    spread = max(spread, 1e-3)
+                    lo = -3.0 * spread
+                    hi = 3.0 * spread
+                ecg_display = np.clip(centered, lo, hi)
+                y_pad = max((hi - lo) * 0.05, 1e-3)
+            else:
+                ecg_display = np.zeros_like(primary_signal, dtype=np.float32)
+                lo, hi, y_pad = -1.0, 1.0, 0.1
+
+            ax_signal.plot(x_minutes, ecg_display, color='black',
+                           linewidth=1.2, alpha=0.9, label='ECG centered amplitude')
+            ax_signal.set_ylim(lo - y_pad, hi + y_pad)
+            ax_signal.set_ylabel('ECG centered amplitude', fontsize=9, color='black')
+            ax_signal.tick_params(axis='y', labelcolor='black')
+
+            bpm_axis = None
+            if hr_series is not None and len(hr_series) == len(primary_signal):
+                hr_arr = np.asarray(hr_series, dtype=np.float32)
+                finite = np.isfinite(hr_arr)
+                plausible = finite & (hr_arr >= 20.0) & (hr_arr <= 240.0)
+                plausible_ratio = float(np.mean(plausible)) if hr_arr.size > 0 else 0.0
+
+                if plausible_ratio >= 0.2:
+                    hr_plot = np.where(plausible, hr_arr, np.nan)
+                    bpm_axis = ax_signal.twinx()
+                    bpm_axis.plot(
+                        x_minutes,
+                        hr_plot,
+                        color='dodgerblue',
+                        linewidth=1.0,
+                        alpha=0.85,
+                        label='Estimated BPM',
+                    )
+                    p1 = float(np.nanpercentile(hr_plot, 1.0))
+                    p99 = float(np.nanpercentile(hr_plot, 99.0))
+                    y_lo = max(20.0, p1 - 5.0)
+                    y_hi = min(220.0, max(y_lo + 10.0, p99 + 5.0))
+                    bpm_axis.set_ylim(y_lo, y_hi)
+                    bpm_axis.set_ylabel('Heart rate (BPM)', fontsize=9, color='dodgerblue')
+                    bpm_axis.tick_params(axis='y', labelcolor='dodgerblue')
+                else:
+                    logger.warning('Skipping BPM overlay: insufficient plausible BPM samples in panel (ratio=%.2f)', plausible_ratio)
+
+            if eda_signal is not None and len(eda_signal) == len(primary_signal):
+                ax_signal.plot(x_minutes, eda_signal, color='seagreen',
+                               linewidth=1.0, alpha=0.65, label='EDA proxy (raw)')
+
+            lines1, labels1 = ax_signal.get_legend_handles_labels()
+            if bpm_axis is not None:
+                lines2, labels2 = bpm_axis.get_legend_handles_labels()
+                ax_signal.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
+            else:
+                ax_signal.legend(loc='upper right', fontsize=8)
+        # Fill preictal/predicted regions (always on main axis)
+        ax_signal.fill_between(x_minutes, ax_signal.get_ylim()[0], ax_signal.get_ylim()[1], where=gt_preictal > 0,
                                color='green', alpha=0.12, label='GT preictal')
-        ax_signal.fill_between(x_minutes, y_min, y_max, where=pred_binary > 0,
+        ax_signal.fill_between(x_minutes, ax_signal.get_ylim()[0], ax_signal.get_ylim()[1], where=pred_binary > 0,
                                color='orange', alpha=0.10, label='Predicted preictal')
-        ax_signal.set_title('PPG / EDA with GT + predicted preictal regions', fontweight='bold', fontsize=10)
-        ax_signal.set_ylabel('Signal (normalized)', fontsize=9)
-        ax_signal.set_ylim(y_min, y_max)
+        ax_signal.set_title('HR / EDA with GT + predicted preictal regions' if is_wearable else 'ECG raw amplitude + BPM with GT + predicted preictal regions', fontweight='bold', fontsize=10)
         ax_signal.grid(True, alpha=0.25)
-        ax_signal.legend(loc='upper right', fontsize=8)
 
         # ── Left-2: ADXL (motion) + HRV dual axis ──────────────────────────────
         ax_adxl = fig.add_subplot(grid[row_adxl, 0], sharex=ax_signal)
         hrv_clean = np.asarray(hrv_series, dtype=np.float32)
 
-        if adxl_series is not None and len(adxl_series) == n_samples:
+        has_emg = emg_signal is not None and len(emg_signal) == n_samples
+        has_mov = mov_signal is not None and len(mov_signal) == n_samples
+        if has_emg:
+            emg_clean = np.asarray(emg_signal, dtype=np.float32)
+            ax_adxl.plot(
+                x_minutes,
+                emg_clean,
+                color='darkorange',
+                linewidth=1.25,
+                alpha=0.9,
+                label='EMG envelope (raw)',
+            )
+        if has_mov:
+            mov_clean = np.asarray(mov_signal, dtype=np.float32)
+            ax_adxl.plot(
+                x_minutes,
+                mov_clean,
+                color='sienna',
+                linewidth=1.1,
+                alpha=0.75,
+                linestyle='--',
+                label='MOV sensor (raw)',
+            )
+        if (not has_emg and not has_mov) and adxl_series is not None and len(adxl_series) == n_samples:
             adxl_clean = np.asarray(adxl_series, dtype=np.float32)
-            adxl_range = float(np.nanmax(adxl_clean)) - float(np.nanmin(adxl_clean))
-            adxl_label = 'ADXL motion (raw)' 
             ax_adxl.plot(x_minutes, adxl_clean, color='darkorange',
-                         linewidth=1.3, alpha=0.9, label=adxl_label)
-            ax_adxl.set_ylabel('ADXL (raw)', color='darkorange', fontsize=9)
-            ax_adxl.tick_params(axis='y', labelcolor='darkorange')
-        else:
-            ax_adxl.set_ylabel('ADXL (no data)', fontsize=9)
+                         linewidth=1.3, alpha=0.9, label='Motion proxy (raw)')
+        ax_adxl.set_ylabel('EMG/MOV', color='darkorange', fontsize=9)
+        ax_adxl.tick_params(axis='y', labelcolor='darkorange')
 
         ax_adxl.grid(True, alpha=0.25)
 
         ax_hrv2 = ax_adxl.twinx()
-        hrv_range = float(np.nanmax(hrv_clean)) - float(np.nanmin(hrv_clean))
-        if hrv_range < 5.0 and hrv_range > 0:
-            hrv_scaled = 10.0 + (hrv_clean - float(np.nanmin(hrv_clean))) / (hrv_range + 1e-8) * 50.0
-            hrv_label = 'HRV (rescaled, ms)'
-        else:
-            hrv_scaled = hrv_clean
-            hrv_label = 'HRV (native, ms)'
+        hrv_scaled = hrv_clean
+        hrv_label = 'HRV (native)'
         ax_hrv2.plot(x_minutes, hrv_scaled, color='teal', linewidth=1.3, alpha=0.85, label=hrv_label)
         ax_hrv2.set_ylabel(hrv_label, color='teal', fontsize=9)
         ax_hrv2.tick_params(axis='y', labelcolor='teal')
-        ax_adxl.set_title('ADXL motion + HRV (dual axis)', fontweight='bold', fontsize=10)
+        ax_adxl.set_title('EMG/MOV + HRV (dual axis)', fontweight='bold', fontsize=10)
 
         adxl_lines, adxl_lbls = ax_adxl.get_legend_handles_labels()
         hrv_lines, hrv_lbls = ax_hrv2.get_legend_handles_labels()
         ax_adxl.legend(adxl_lines + hrv_lines, adxl_lbls + hrv_lbls, loc='upper right', fontsize=8)
 
         # ── Left-EEG (optional): dedicated EEG subplot ─────────────────────────
+        eeg_raw_stored = None  # Store for later use in alarm plot overlay
         ax_eeg_plot = None
         if has_eeg:
             ax_eeg_plot = fig.add_subplot(grid[row_eeg, 0], sharex=ax_signal)
-            eeg_norm = _normalize_signal(eeg_signal)
-            ax_eeg_plot.plot(x_minutes, eeg_norm, color='purple', linewidth=1.0, alpha=0.85,
-                             label=f'{eeg_signal_label} (norm)')
-            ax_eeg_plot.fill_between(x_minutes, 0.0, 1.0, where=gt_preictal > 0,
+            eeg_raw = np.asarray(eeg_signal, dtype=np.float32)
+            eeg_raw_stored = eeg_raw  # Store for alarm plot overlay
+            ax_eeg_plot.plot(x_minutes, eeg_raw, color='purple', linewidth=1.0, alpha=0.85,
+                             label=f'{eeg_signal_label} (raw)')
+            y0, y1 = float(np.nanmin(eeg_raw)), float(np.nanmax(eeg_raw))
+            if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
+                y0, y1 = -1.0, 1.0
+            ax_eeg_plot.fill_between(x_minutes, y0, y1, where=gt_preictal > 0,
                                      color='green', alpha=0.08)
-            ax_eeg_plot.set_title(eeg_signal_label, fontweight='bold', fontsize=10)
-            ax_eeg_plot.set_ylabel('EEG (norm)', color='purple', fontsize=9)
+            ax_eeg_plot.set_title(f'{eeg_signal_label} (raw)', fontweight='bold', fontsize=10)
+            ax_eeg_plot.set_ylabel('EEG amplitude', color='purple', fontsize=9)
             ax_eeg_plot.tick_params(axis='y', labelcolor='purple')
-            ax_eeg_plot.set_ylim(0.0, 1.0)
+            ax_eeg_plot.set_ylim(y0, y1)
             ax_eeg_plot.grid(True, alpha=0.25)
             ax_eeg_plot.legend(loc='upper right', fontsize=8)
 
@@ -511,43 +703,49 @@ class SignalVisualizer:
                                    color='crimson', alpha=0.10, label='GT onset')
             ax_smooth.set_title('State probabilities', fontweight='bold', fontsize=10)
         else:
-            positive_gt = true_countdown[true_countdown >= 0]
-            observed_gt_max = float(np.max(positive_gt)) if positive_gt.size > 0 else 0.0
-            if observed_gt_max <= 1.5:
-                countdown_ref_max = 1.0
-            else:
-                countdown_ref_max = max(30.0, observed_gt_max)
-
-            gt_countdown_ref = np.full_like(true_countdown, 1.0, dtype=np.float32)
-            gt_preictal_mask = true_countdown >= 0
-            if np.any(gt_preictal_mask):
-                preictal_max = 10.0
-                gt_countdown_ref[gt_preictal_mask] = true_countdown[gt_preictal_mask] / preictal_max
-            if countdown_ref_max > 0:
-                gt_countdown_ref_norm = np.clip(gt_countdown_ref / countdown_ref_max, 0.0, 1.0)
-            else:
-                gt_countdown_ref_norm = np.zeros_like(gt_countdown_ref, dtype=np.float32)
-
-            pred_scale = max(countdown_ref_max, float(np.max(np.abs(pred_countdown))) + 1e-6)
-            pred_countdown_ref = np.clip(pred_countdown.astype(np.float32) / pred_scale, 0.0, 1.0)
+            tau_min = max(0.5, float(np.nanpercentile(np.clip(true_countdown[true_countdown >= 0], 0.0, None), 50)) if np.any(true_countdown >= 0) else 2.0)
+            imminent_prob = np.exp(-np.clip(pred_countdown.astype(np.float32), 0.0, None) / tau_min)
+            imminent_prob = np.clip(imminent_prob, 0.0, 1.0)
             ax_smooth.plot(
                 x_minutes,
-                gt_countdown_ref_norm,
-                color='forestgreen',
-                linewidth=1.8,
-                alpha=0.9,
-                linestyle='-',
-                label='GT countdown ref (continuous)',
-            )
-            ax_smooth.plot(
-                x_minutes,
-                pred_countdown_ref,
+                imminent_prob,
                 color='crimson',
-                linewidth=1.6,
-                alpha=0.85,
+                linewidth=1.5,
+                alpha=0.9,
                 linestyle=':',
-                label='Pred countdown ref',
+                label='Imminent risk prob (countdown head)',
             )
+
+        if local_acc is not None:
+            ax_acc = ax_smooth.twinx()
+            ax_acc.plot(
+                x_minutes,
+                local_acc,
+                color='deepskyblue',
+                linewidth=1.4,
+                alpha=0.8,
+                linestyle='-.',
+                label='Local rolling accuracy',
+            )
+            ax_acc.set_ylim(0.0, 1.0)
+            ax_acc.set_ylabel('Local accuracy', color='deepskyblue', fontsize=9)
+            ax_acc.tick_params(axis='y', labelcolor='deepskyblue')
+            lines1, labels1 = ax_smooth.get_legend_handles_labels()
+            lines2, labels2 = ax_acc.get_legend_handles_labels()
+            ax_smooth.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=7)
+
+        event_indices = np.where(gt_events > 0)[0]
+        max_event_lines = 12
+        if event_indices.size > max_event_lines:
+            event_indices = event_indices[-max_event_lines:]
+        for idx_ev, ev in enumerate(event_indices.tolist()):
+            x_ev = float(x_minutes[ev])
+            label = 'Past event' if idx_ev == 0 else None
+            ax_smooth.axvline(x=x_ev, color='magenta', linestyle='-', linewidth=1.1, alpha=0.7, label=label)
+            ax_signal.axvline(x=x_ev, color='magenta', linestyle='-', linewidth=0.8, alpha=0.55)
+            ax_adxl.axvline(x=x_ev, color='magenta', linestyle='-', linewidth=0.8, alpha=0.55)
+            if ax_eeg_plot is not None:
+                ax_eeg_plot.axvline(x=x_ev, color='magenta', linestyle='-', linewidth=0.8, alpha=0.55)
 
         if np.any(gt_preictal > 0):
             preictal_indices = np.where(gt_preictal > 0)[0]
@@ -565,10 +763,26 @@ class SignalVisualizer:
 
         ax_smooth.set_ylim(0.0, 1.0)
         ax_smooth.set_ylabel('Alarm prob')
+        
+        # Add EEG overlay to alarm plot if available
+        if eeg_raw_stored is not None and len(eeg_raw_stored) > 0 and np.any(np.isfinite(eeg_raw_stored)):
+            ax_eeg_overlay = ax_smooth.twinx()
+            eeg_min = np.nanmin(eeg_raw_stored)
+            eeg_max = np.nanmax(eeg_raw_stored)
+            if eeg_max > eeg_min:
+                eeg_scaled = (eeg_raw_stored - eeg_min) / (eeg_max - eeg_min)
+            else:
+                eeg_scaled = eeg_raw_stored
+            ax_eeg_overlay.plot(x_minutes, eeg_scaled, color='mediumpurple', linewidth=1.1, alpha=0.50, label='EEG activity')
+            ax_eeg_overlay.set_ylabel('EEG (scaled)', color='mediumpurple', fontsize=9)
+            ax_eeg_overlay.tick_params(axis='y', labelcolor='mediumpurple')
+            ax_eeg_overlay.set_ylim(0.0, 1.1)
+        
         if not state_mode:
-            ax_smooth.set_title('Smoothed alarm + countdown references', fontweight='bold', fontsize=10)
+            ax_smooth.set_title('Head probabilities + local runtime accuracy', fontweight='bold', fontsize=10)
         ax_smooth.grid(True, alpha=0.25)
-        ax_smooth.legend(loc='upper right', fontsize=7)
+        if local_acc is None:
+            ax_smooth.legend(loc='upper right', fontsize=7)
 
         # ── Left-heat: inference heatmap ────────────────────────────────────────
         ax_heat = fig.add_subplot(grid[row_heat, 0], sharex=ax_signal)
@@ -586,16 +800,21 @@ class SignalVisualizer:
             ytick_pos = [0.5 + idx for idx in range(len(heatmap_rows))]
             n_rows = len(heatmap_rows)
         else:
-            pred_countdown_norm = np.clip(pred_countdown / pred_scale, 0.0, 1.0)
-            gt_proximity = gt_countdown_ref_norm
+            alert_raw = np.clip(pred_preictal_prob, 0.0, 1.0)
+            alert_smooth = np.clip(pred_preictal_smooth, 0.0, 1.0) if has_smooth else np.clip(pred_preictal_prob, 0.0, 1.0)
+            no_risk_prob = np.clip(1.0 - alert_raw, 0.0, 1.0)
+            tau_min = max(0.5, float(np.nanpercentile(np.clip(true_countdown[true_countdown >= 0], 0.0, None), 50)) if np.any(true_countdown >= 0) else 2.0)
+            imminent_prob = np.exp(-np.clip(pred_countdown.astype(np.float32), 0.0, None) / tau_min)
+            imminent_prob = np.clip(imminent_prob, 0.0, 1.0)
             heatmap_rows = [
-                gt_proximity,
-                np.clip(pred_preictal_prob, 0.0, 1.0),
-                pred_countdown_norm,
+                no_risk_prob,
+                alert_raw,
+                alert_smooth,
+                imminent_prob,
             ]
-            ytick_labels = ['GT Countdown (cont)', 'Raw Prob', 'Pred Countdown']
-            ytick_pos    = [0.5, 1.5, 2.5]
-            n_rows = 3
+            ytick_labels = ['No-risk Prob', 'Alert Prob', 'Smoothed Alert', 'Imminent Prob']
+            ytick_pos = [0.5 + idx for idx in range(len(heatmap_rows))]
+            n_rows = len(heatmap_rows)
 
         heatmap = np.vstack(heatmap_rows)
         im = ax_heat.imshow(
@@ -615,12 +834,43 @@ class SignalVisualizer:
         if state_mode:
             ax_heat.set_title('State-mode inference heatmap', fontweight='bold', fontsize=10)
         else:
-            ax_heat.set_title('Inference heatmap (GT processed + raw + countdown)', fontweight='bold', fontsize=10)
+            ax_heat.set_title('Inference heatmap (probability heads)', fontweight='bold', fontsize=10)
         fig.colorbar(im, ax=ax_heat, fraction=0.035, pad=0.01)
 
-        # Right column: train + validation confusion matrices for epoch views,
-        # or a single full-set confusion matrix for final/test views.
+        # ── Left-token waterfall: rolling token occupancy ─────────────────────
+        if add_token_row:
+            ax_token = fig.add_subplot(grid[row_token, 0], sharex=ax_signal)
+            im_token = ax_token.imshow(
+                token_roll.T,
+                aspect='auto',
+                origin='lower',
+                interpolation='nearest',
+                cmap='magma',
+                vmin=0,
+                vmax=token_vmax,
+                extent=[x_minutes[0], x_minutes[-1] if len(x_minutes) > 1 else 1.0, 0, token_roll.shape[1]],
+            )
+            ax_token.set_ylabel('Token ID')
+            ax_token.set_xlabel('Time (minutes)')
+            title = 'Token Activation Waterfall'
+            if token_window is not None:
+                title += f' (window={token_window})'
+            ax_token.set_title(title, fontweight='bold', fontsize=10)
+            if token_labels is not None and len(token_labels) == token_roll.shape[1]:
+                yticks = np.arange(0.5, token_roll.shape[1] + 0.5, 1.0)
+                if len(token_labels) > 16:
+                    step = int(np.ceil(len(token_labels) / 16.0))
+                    yticks = yticks[::step]
+                    show_labels = token_labels[::step]
+                else:
+                    show_labels = token_labels
+                ax_token.set_yticks(yticks)
+                ax_token.set_yticklabels(show_labels, fontsize=7)
+            fig.colorbar(im_token, ax=ax_token, fraction=0.035, pad=0.01, label='Rolling occupancy')
 
+        # Confusion matrices removed for better visualization clarity
+        # (Confusion matrix analysis now available in separate metrics files)
+        
         def _resolve_cm_inputs(default_true: np.ndarray,
                                default_prob: np.ndarray,
                                full_true_countdown: Optional[np.ndarray],
@@ -678,31 +928,31 @@ class SignalVisualizer:
             )
             return im_local
 
-        val_true_preictal, val_pred_probs = _resolve_cm_inputs(
-            gt_preictal,
-            pred_preictal_prob,
-            cm_true_countdown,
-            cm_pred_preictal_prob,
-        )
-
-        if train_cm_true_preictal is not None and train_cm_pred_preictal_prob is not None:
-            right_grid = grid[:, 1].subgridspec(2, 1, hspace=0.28)
-            train_true_preictal, train_pred_probs = _resolve_cm_inputs(
-                gt_preictal,
-                pred_preictal_prob,
-                train_cm_true_preictal.astype(int),
-                train_cm_pred_preictal_prob,
-            )
-            ax_cm_train = fig.add_subplot(right_grid[0, 0])
-            _draw_cm(ax_cm_train, train_true_preictal, train_pred_probs, 'Train')
-
-            ax_cm_val = fig.add_subplot(right_grid[1, 0])
-            im_cm_val = _draw_cm(ax_cm_val, val_true_preictal, val_pred_probs, 'Validation')
-            fig.colorbar(im_cm_val, ax=[ax_cm_train, ax_cm_val], fraction=0.035, pad=0.02)
-        else:
-            ax_cm = fig.add_subplot(grid[:, 1])
-            im_cm = _draw_cm(ax_cm, val_true_preictal, val_pred_probs, 'Confusion')
-            fig.colorbar(im_cm, ax=ax_cm, fraction=0.035, pad=0.02)
+        # val_true_preictal, val_pred_probs = _resolve_cm_inputs(
+        #     gt_preictal,
+        #     pred_preictal_prob,
+        #     cm_true_countdown,
+        #     cm_pred_preictal_prob,
+        # )
+        #
+        # if train_cm_true_preictal is not None and train_cm_pred_preictal_prob is not None:
+        #     right_grid = grid[:, 1].subgridspec(2, 1, hspace=0.28)
+        #     train_true_preictal, train_pred_probs = _resolve_cm_inputs(
+        #         gt_preictal,
+        #         pred_preictal_prob,
+        #         train_cm_true_preictal.astype(int),
+        #         train_cm_pred_preictal_prob,
+        #     )
+        #     ax_cm_train = fig.add_subplot(right_grid[0, 0])
+        #     _draw_cm(ax_cm_train, train_true_preictal, train_pred_probs, 'Train')
+        #
+        #     ax_cm_val = fig.add_subplot(right_grid[1, 0])
+        #     im_cm_val = _draw_cm(ax_cm_val, val_true_preictal, val_pred_probs, 'Validation')
+        #     fig.colorbar(im_cm_val, ax=[ax_cm_train, ax_cm_val], fraction=0.035, pad=0.02)
+        # else:
+        #     ax_cm = fig.add_subplot(grid[:, 1])
+        #     im_cm = _draw_cm(ax_cm, val_true_preictal, val_pred_probs, 'Confusion')
+        #     fig.colorbar(im_cm, ax=ax_cm, fraction=0.035, pad=0.02)
 
         # Transparent metadata: report effective sampling shown on the x-axis.
         if len(x_minutes) > 1:
