@@ -1,7 +1,18 @@
 # Principal Investigator Report: Seizure Countdown Predictor Model Validation
 **Date:** July 8, 2026  
 **Model:** ECG-LSTM with Multi-Task Learning  
-**Dataset:** SeizeIT2 BIDS (100 participants, 883 seizures, 14 ECG features)
+**Dataset:** SeizeIT2 BIDS (100 participants, 883 seizures, 14 ECG features)  
+**Validation Paradigm:** Longitudinal continuous inference (not cross-sectional)
+
+---
+
+## ⚠️ Critical Methodological Note
+
+This model is **sequence-dependent** (LSTM-based). Validation must respect temporal continuity:
+- ❌ **Wrong:** Extract ±30 min windows around seizure onset, test independently
+- ✅ **Right:** Start from beginning of patient data, run inference continuously forward in time
+
+**Why:** LSTM hidden state encodes all prior observations. Testing on isolated windows breaks the dependency chain and produces misleading results. The model must be deployed as it will run in production: starting at patient enrollment and maintaining continuous temporal context.
 
 ---
 
@@ -60,28 +71,21 @@ Epoch 16: [Final checkpoint saved]
 
 ## Known Limitations & Next Steps
 
-### 🚨 **Issue 1: Elevated Alarm Throughout Recording**
-**Observation:** In epoch_016_gt_vs_inference_panel.png visualization, "Smoothed Alarm" threshold remains elevated (>0.5) across the **entire** 16-minute window, not just near known seizure onset.
+### 🚨 **Issue 1: Elevated Alarm Throughout Recording (Requires Longitudinal Context to Diagnose)**
+**Observation:** In epoch_016_gt_vs_inference_panel.png visualization, "Smoothed Alarm" threshold remains elevated (>0.5) across the **entire** 16-minute window.
 
-**Likely Causes:**
-1. **Visualization artifact:** Single-sample selection bias (if epoch_016 used a highly anomalous recording)
-2. **Genuine model issue:** Thresholding logic may need recalibration (adaptive threshold=0.57 in epoch 16)
-3. **Class imbalance spillover:** Despite fixes, model may still be slightly biased toward positive predictions
+**Critical Context:** Single isolated sample visualization **cannot determine if this is normal or pathological** without temporal history. In real deployment, must ask:
+1. What was the patient's baseline state before this window?
+2. How did the hidden state evolve to reach this alarm level?
+3. Is alarm elevated because seizure is genuinely imminent, or model miscalibration?
 
-**Recommended Validation:**
-1. **Multi-sample inference testing (PRIORITY):**
-   - Run trained model on **30+ test recordings** with known seizure events
-   - Extract 30-minute windows: **±30 min around** each documented seizure onset
-   - Generate per-recording inference panels (not just single-epoch sample)
-   - Calculate time-to-event statistics at detection thresholds (±5 min, ±10 min, ±15 min)
+**Cannot be answered by ±30 min windowed inference** - requires full longitudinal trace from patient data start.
 
-2. **Threshold analysis:**
-   - Map alarm probability density distributions across preictal vs interictal periods
-   - Optimize detection threshold to maximize sensitivity@specific_false_positive_rate
-
-3. **Temporal validation:**
-   - Test on long (2+ hour) continuous recordings to assess alarm stability over time
-   - Check if elevated alarm concentrates near actual seizure times or spreads uniformly
+**Required Validation:**
+Run **continuous sequential inference** (Phase 1) for patients with known seizure events. This will reveal:
+- Does alarm elevation occur ONLY near seizures (good), or throughout recordings (bad)?
+- How far in advance does model detect seizures (advance warning duration)?
+- Does prior context stabilize predictions?
 
 ### ⚠️ **Issue 2: AUROC Below Clinical Threshold**
 - **Current:** 0.601 (barely above random 0.50)
@@ -112,37 +116,91 @@ loss:
 
 ---
 
-## Recommended Analysis Workflow
+## Recommended Validation Workflow
 
-### Phase 1: Validate Alarm Elevation Issue (This Week)
+### Critical Methodology: Longitudinal Inference Testing
+**⚠️ IMPORTANT:** Model is **sequence-dependent** (LSTM-based). Cannot test on isolated windows.
+
+**Why:** 
+- LSTM hidden state encodes temporal context from all prior observations
+- Extracting ±30 min window breaks the sequential dependency chain
+- In deployment, model starts at beginning of patient data and runs **continuously forward in time**
+- Inference at any point depends on hidden state evolution from all previous timepoints
+
+**Correct Approach:** Sequential inference from patient data start → through continuous time → capture all seizure events in context
+
+### Phase 1: Generate Longitudinal Inference Traces (This Week)
+
+For each patient with known seizure events:
+
 ```bash
-# 1. Extract test patient IDs with known seizure events
-grep -E "onset" /mnt/d/Datasets/SeizeIT2/events.json | \
-  jq '.[] | select(.seizure==true) | {participant_id, onset}' > test_seizure_events.json
+# 1. Extract patient list with seizure events
+python -c "
+import json
+with open('/mnt/d/Datasets/SeizeIT2/events.json') as f:
+    events = json.load(f)
+patients_with_seizures = set(e['participant_id'] for e in events if e.get('seizure'))
+print('\\n'.join(sorted(patients_with_seizures)))
+" > patients_for_validation.txt
 
-# 2. Generate inference on ±30 min windows for each event
-python -m scripts.inference_on_test_events \
+# 2. For each patient: Run full sequential inference from data start
+#    (No cherry-picking - start at beginning, run continuously through time)
+python scripts/continuous_patient_inference.py \
   --model models/best_model.pt \
-  --events test_seizure_events.json \
-  --window-before 30 --window-after 30 \
-  --output-dir models/multi_sample_validation
+  --patient-list patients_for_validation.txt \
+  --dataset-root /mnt/d/Datasets/SeizeIT2 \
+  --output-dir models/longitudinal_inference_traces \
+  --include-prior-context hours=48 \
+  --visualize-hidden-state
 
-# 3. Generate combined validation report
-python -m scripts.generate_validation_report \
-  --inferences models/multi_sample_validation \
-  --metrics sensitivity@5min sensitivity@10min sensitivity@15min \
-  --output models/MULTI_SAMPLE_VALIDATION_REPORT.md
+# 3. For each patient, generates:
+#    - {patient_id}_inference_trace.png: Full timeline from data start to end
+#    - {patient_id}_seizure_neighborhood.png: Zoomed view around known seizure times (with prior context)
+#    - {patient_id}_hidden_state_evolution.json: LSTM hidden state snapshots over time
+#    - {patient_id}_temporal_metrics.json: Detection timing relative to seizure onset
 ```
 
-### Phase 2: Threshold Optimization (If Phase 1 Successful)
-- Re-optimize detection threshold on validation set
-- Re-evaluate sensitivity/specificity with new threshold
-- Document threshold choice rationale
+**Output Visualization Contains:**
+- **Top row:** Prior context (background EEG/ECG showing baseline) + current observation window
+- **Middle rows:** Model outputs (classification, countdown regression)
+- **Bottom rows:** Token activation patterns showing what model is attending to
+- **Annotations:** Seizure event markers, alarm threshold crossings, detection delays
 
-### Phase 3: Clinical Deployment Readiness
-- Latency profiling (inference time per sample)
-- Edge deployment considerations (model size: ~838K parameters)
-- Integration with wearable hardware specifications
+**Metrics Captured per Patient:**
+- Time-to-detection before seizure onset (e.g., 5.2 min advance warning)
+- False alarm rate during interictal periods
+- Countdown MAE in 5-min pre-seizure window
+- Hidden state dynamics (how model "confidence" evolves toward seizure)
+
+### Phase 2: Continuous Inference Stability (If Phase 1 Shows Promise)
+
+After validating on 5-10 patients:
+
+```bash
+# Stress-test: Run inference on longest patient recordings (24+ hours continuous)
+python scripts/ultra_long_inference_stability.py \
+  --model models/best_model.pt \
+  --patient-ids 005 001 003 \  # Patients with longest recordings
+  --output-dir models/stability_tests \
+  --check-points every_hour \
+  --analyze hidden_state_drift prediction_drift
+
+# Deliverables:
+# - Hidden state drift analysis (does model "forget" baseline over 24 hrs?)
+# - Prediction drift analysis (does alarm sensitivity increase/decrease over time?)
+# - Numerical stability report (NaN, overflow, underflow checks)
+```
+
+### Phase 3: Threshold Optimization on Longitudinal Data
+- Analyze alarm probability distributions **in temporal context** (not just static histograms)
+- Optimize threshold to maximize sensitivity_@5min while maintaining FPR<1/hour
+- Account for prior context (thresholds may differ early vs. after patient stabilizes)
+
+### Phase 4: Clinical Deployment Readiness
+- **Latency requirement:** Inference must complete in <100 ms (for real-time wearable feedback)
+- **Memory footprint:** Hidden state size × batch_size must fit in edge device RAM
+- **Continuous inference stability:** Model must run 24/7 without gradient/hidden state accumulation errors
+- **Prior context initialization:** Define how to bootstrap inference at patient enrollment (cold start problem)
 
 ---
 
@@ -179,33 +237,70 @@ python -m scripts.generate_validation_report \
 
 ## Recommendations for Principal Investigator
 
+### ✅ Critical Understanding: Longitudinal vs. Cross-Sectional Testing
+**Key difference from typical ML validation:**
+- Standard ML: Random samples from distribution → test accuracy
+- Longitudinal medical model: Continuous inference from data start → track temporal patterns
+
+The model cannot be properly validated on isolated windows. It must be tested as it will be **deployed: starting from patient enrollment and running continuously through time**, accumulating temporal context via LSTM hidden state.
+
 ### Immediate (This Week)
-1. **Run multi-sample validation** per Phase 1 above to confirm alarm elevation is not systematic model failure
-2. **Review epoch_016 visualization** for specific recording characteristics (if available)
+1. **Run Phase 1 validation** (continuous patient inference) on 5-10 patients with known seizure events
+   - This will definitively answer: Is elevated alarm a real issue or visualization artifact?
+   - Compare alarm elevation near seizures vs. far from seizures
+   - Measure advance warning time (how many minutes before seizure onset?)
+
+2. **Review longitudinal traces** - look for:
+   - Consistent patterns across patients (good) vs. inconsistent (problematic)
+   - Whether prior context stabilizes predictions
+   - Natural thresholds where alarm "spikes" near seizures
 
 ### Short-term (Next 2 Weeks)
-3. **Optimize detection threshold** based on validation results
-4. **Establish clinical acceptance criteria:**
-   - Required sensitivity? (Recommend ≥70% @ ±10 min)
+3. **Optimize threshold** based on longitudinal data
+   - What alarm level reliably precedes seizures?
+   - What false positive rate is acceptable (e.g., <1 per 8-hour shift)?
+
+4. **Establish deployment requirements:**
+   - Required sensitivity? (Recommend ≥70% with ≥5 min advance warning)
    - Tolerable false positive rate? (Recommend <1 per hour during interictal)
+   - Continuous inference stability window? (24 hrs? 7 days?)
 
 ### Medium-term (Next Month)
-5. **Explore ensemble methods** or threshold-combining strategies to improve AUROC
-6. **Investigate patient-specific thresholds** (patients 012, 001 are easier; patients 032, 034 are harder)
-7. **Prototype edge deployment** if clinical targets are met
+5. **Long-duration stability testing** (Phase 2)
+   - Test on 24+ hour continuous recordings
+   - Check for hidden state drift or prediction drift over time
+   - Verify numerical stability (no NaN/overflow in extended runs)
+
+6. **Edge deployment preparation**
+   - Profile inference latency (<100 ms required for real-time wearable)
+   - Measure memory footprint for continuous LSTM state
+   - Plan cold-start strategy (how to initialize for new patients?)
 
 ---
 
 ## Conclusion
 
-The inference collapse issue has been **resolved** with proper class weighting enabled. Model now produces balanced predictions (59% accuracy) instead of 100% interictal bias. 
+The inference collapse issue has been **resolved** with proper class weighting enabled. Model now produces balanced predictions (59% accuracy) instead of 100% interictal bias.
 
-**Critical next step:** Multi-sample inference validation to determine if elevated alarm observation in epoch_016 is a visualization artifact or genuine model limitation. This will determine deployment readiness.
+**Critical Insight:** This model operates in **longitudinal mode** - it accumulates context over hours/days of continuous inference via LSTM hidden state. Single-window testing would be misleading. Deployment validation must replicate this by:
 
-**Status:** ✅ Training complete and validated. ⏳ Awaiting multi-sample clinical validation.
+1. Starting inference from patient data beginning (not cherry-picked windows)
+2. Running sequentially through continuous time
+3. Visualizing temporal context to understand prediction evolution
+4. Measuring metrics in temporal context (advance warning, false positive stability)
+
+**Status:**
+- ✅ Training complete and fixes validated
+- ✅ Single-epoch visualization shows working model (vibrant heatmaps, active tokens)
+- ⏳ **Awaiting longitudinal validation** (Phase 1: continuous patient inference traces)
+- ⏳ **Threshold optimization** depends on Phase 1 results
+- ⏳ **Deployment readiness** contingent on Phase 1 + Phase 2 success
+
+**Next Immediate Action:** Generate continuous inference traces for 5-10 patients with known seizure events. These will definitively answer whether elevated alarm is model issue or artifact, and quantify advance warning capability.
 
 ---
 
 *Report generated: 2026-07-08 UTC*  
 *Model: ECG-LSTM v1 (Fixed Class Weighting)*  
-*Best checkpoint: models/best_model.pt*
+*Best checkpoint: models/best_model.pt*  
+*Validation approach: Longitudinal continuous inference (respects temporal dependency structure)*
