@@ -2394,6 +2394,7 @@ def _real_cache_path(config: Config, args) -> Path:
         'augment_preictal': bool(config.data.augment_preictal),
         'augmentation_factor': int(config.data.augmentation_factor) if config.data.augment_preictal else 0,
         'long_sweep_training': bool(getattr(args, 'long_sweep_training', False)),
+        'patient_sequential': bool(getattr(args, 'patient_sequential', False)),
     }
     key = hashlib.md5(json.dumps(key_payload, sort_keys=True).encode('utf-8')).hexdigest()[:16]
     return cache_root / f"real_dataset_{key}.npz"
@@ -2776,6 +2777,8 @@ def main():
     elif world_size > 1:
         # In DDP mode, use GPU for each local rank
         device = torch.device(f'cuda:{local_rank}')
+        # If launched with torchrun, force distributed mode on regardless of YAML default.
+        config.training.distributed = True
     elif torch.cuda.is_available():
         # Single GPU mode
         device = torch.device(f'cuda:{local_rank}')
