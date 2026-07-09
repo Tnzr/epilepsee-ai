@@ -6,6 +6,55 @@
 
 ---
 
+## Update: Current Status After 2-Epoch DDP Validation Run
+
+This document originally captured an earlier methodology-risk review. The
+current repo state now includes both a completed 2-epoch DDP validation run
+and methodology updates applied before the next full retraining cycle.
+
+### Verified 2-Epoch Run Outcome
+
+- Epoch 2 training completed.
+- Epoch 2 validation completed.
+- Final epoch-2 metrics:
+   - `Train Loss: 7.5822`
+   - `Val Loss: 11.3642`
+   - `Val MAE: 4.1048 min`
+- Artifacts saved successfully:
+   - `models/epoch_visualizations/epoch_002_gt_vs_inference_panel.png`
+   - `models/monitoring/epoch_002_anomaly_report.json`
+   - `models/best_model.pt`
+   - `models/last_model.pt`
+   - `models/training_history.json`
+
+### Post-Validation Failure and Resolution
+
+The run exited after validation, during test-set evaluation, due to an output
+unpacking mismatch in `src/evaluation.py`:
+
+- Failure site: `pre_ictal_pred, countdown_pred = self._forward_model(...)`
+- Cause: evaluation still expected a strict 2-tensor return while training had
+   already been hardened to support tuple/list/dict model outputs with
+   auxiliaries.
+- Status: fixed in code. The evaluation wrapper now normalizes tuple/list/dict
+   outputs the same way as training.
+
+### Methodology Changes Implemented Before Full Retraining
+
+1. **Onset-aware class balancing**
+    - Positive class pressure is increased near onset-region samples, rather
+       than relying only on a global class weight.
+
+2. **Temporal onset weighting**
+    - Classification and regression losses now apply capped per-sample
+       multipliers that increase as countdown approaches seizure onset.
+
+3. **Dual alert confusion diagnostics**
+    - Wandb logs now include both raw-alert and smoothed-alert confusion
+       matrices so calibration issues are not hidden by post-processing.
+
+---
+
 ## ⚠️ CRITICAL: Training-Deployment Mismatch Discovered
 
 **IMPORTANT CONTEXT FOR THIS REPORT:**

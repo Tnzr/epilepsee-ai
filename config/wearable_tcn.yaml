@@ -58,6 +58,15 @@ loss:
   use_class_weighting: true
   classification_positive_weight: 141.0
   max_positive_weight: 200.0
+  onset_positive_weight_boost: 1.5
+
+  # Additional onset-aware temporal weighting so alert/regression pressure
+  # grows as samples approach annotated seizure onset.
+  temporal_focus_tau_min: 5.0
+  classification_temporal_boost: 1.5
+  classification_temporal_max_multiplier: 4.0
+  regression_temporal_boost: 0.5
+  regression_temporal_max_multiplier: 3.0
 
 training:
   optimizer: "adam"

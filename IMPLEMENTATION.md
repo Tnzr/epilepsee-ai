@@ -34,6 +34,30 @@ A complete **Object-Oriented** seizure anticipation framework with:
 ✅ Gradient clipping (max_norm=1.0)  
 ✅ TensorBoard logging support  
 
+### Methodology Controls Added Before Full Retraining ✅
+
+The active training path now includes three additional safeguards aimed at
+preventing flat alert behavior under severe interictal/preictal imbalance:
+
+1. **Onset-aware class balancing**
+    - Classification loss still uses global positive-class weighting.
+    - A modest additional positive-weight boost is applied when onset-region
+       samples are present, increasing pressure on the rare alert windows that
+       matter most clinically.
+
+2. **Temporal onset weighting**
+    - Classification and regression losses now receive extra per-sample
+       multipliers that grow as countdown approaches annotated onset.
+    - Weight growth is capped to avoid unstable gradients while still
+       emphasizing high-urgency errors.
+
+3. **Raw vs. smoothed alert diagnostics**
+    - Wandb logging now publishes separate confusion matrices for:
+       - the raw alert head output, and
+       - the causally smoothed alert signal shown in the panel.
+    - This prevents visual/metric mismatches where the displayed smoothed curve
+       appears elevated while the raw thresholded head still predicts interictal.
+
 ---
 
 ## Quick Start

@@ -716,6 +716,7 @@ class SignalVisualizer:
                 label='Imminent risk prob (countdown head)',
             )
 
+        ax_acc = None
         if local_acc is not None:
             ax_acc = ax_smooth.twinx()
             ax_acc.plot(
@@ -730,9 +731,6 @@ class SignalVisualizer:
             ax_acc.set_ylim(0.0, 1.0)
             ax_acc.set_ylabel('Local accuracy', color='deepskyblue', fontsize=9)
             ax_acc.tick_params(axis='y', labelcolor='deepskyblue')
-            lines1, labels1 = ax_smooth.get_legend_handles_labels()
-            lines2, labels2 = ax_acc.get_legend_handles_labels()
-            ax_smooth.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=7)
 
         event_indices = np.where(gt_events > 0)[0]
         max_event_lines = 12
@@ -742,10 +740,6 @@ class SignalVisualizer:
             x_ev = float(x_minutes[ev])
             label = 'Past event' if idx_ev == 0 else None
             ax_smooth.axvline(x=x_ev, color='magenta', linestyle='-', linewidth=1.1, alpha=0.7, label=label)
-            ax_signal.axvline(x=x_ev, color='magenta', linestyle='-', linewidth=0.8, alpha=0.55)
-            ax_adxl.axvline(x=x_ev, color='magenta', linestyle='-', linewidth=0.8, alpha=0.55)
-            if ax_eeg_plot is not None:
-                ax_eeg_plot.axvline(x=x_ev, color='magenta', linestyle='-', linewidth=0.8, alpha=0.55)
 
         if np.any(gt_preictal > 0):
             preictal_indices = np.where(gt_preictal > 0)[0]
@@ -781,8 +775,16 @@ class SignalVisualizer:
         if not state_mode:
             ax_smooth.set_title('Head probabilities + local runtime accuracy', fontweight='bold', fontsize=10)
         ax_smooth.grid(True, alpha=0.25)
-        if local_acc is None:
-            ax_smooth.legend(loc='upper right', fontsize=7)
+        legend_lines, legend_labels = ax_smooth.get_legend_handles_labels()
+        if ax_acc is not None:
+            acc_lines, acc_labels = ax_acc.get_legend_handles_labels()
+            legend_lines += acc_lines
+            legend_labels += acc_labels
+        if eeg_raw_stored is not None and len(eeg_raw_stored) > 0 and np.any(np.isfinite(eeg_raw_stored)):
+            eeg_lines, eeg_labels = ax_eeg_overlay.get_legend_handles_labels()
+            legend_lines += eeg_lines
+            legend_labels += eeg_labels
+        ax_smooth.legend(legend_lines, legend_labels, loc='upper right', fontsize=7)
 
         # ── Left-heat: inference heatmap ────────────────────────────────────────
         ax_heat = fig.add_subplot(grid[row_heat, 0], sharex=ax_signal)

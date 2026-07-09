@@ -11,7 +11,9 @@ Features:
 
 import os
 import json
+import re
 import logging
+import importlib
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,10 +21,11 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, WeightedRandomSampler
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 import numpy as np
 from collections import defaultdict
 import time
+from pathlib import Path
 
 try:
     from tqdm.auto import tqdm
@@ -30,11 +33,53 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-try:
-    import wandb
-    HAS_WANDB = True
-except ImportError:
-    HAS_WANDB = False
+def _import_wandb_safely():
+    """Import real wandb package even when local ./wandb folder shadows it."""
+    try:
+        import wandb as _wandb
+        if hasattr(_wandb, 'init') and hasattr(_wandb, 'Image'):
+            return _wandb, True
+    except Exception:
+        pass
+
+    try:
+        import sys
+        import site
+
+        repo_root = str(Path(__file__).resolve().parents[1])
+        blocked = {
+            '',
+            os.getcwd(),
+            repo_root,
+        }
+
+        orig_path = list(sys.path)
+        try:
+            sys.modules.pop('wandb', None)
+            clean_path = [
+                p for p in sys.path
+                if str(Path(p).resolve()) not in {str(Path(x).resolve()) for x in blocked if x}
+            ]
+            for sp in site.getsitepackages():
+                if sp not in clean_path:
+                    clean_path.insert(0, sp)
+            user_site = site.getusersitepackages()
+            if user_site and user_site not in clean_path:
+                clean_path.insert(0, user_site)
+
+            sys.path = clean_path
+            _wandb = importlib.import_module('wandb')
+            if hasattr(_wandb, 'init') and hasattr(_wandb, 'Image'):
+                return _wandb, True
+        finally:
+            sys.path = orig_path
+    except Exception:
+        pass
+
+    return None, False
+
+
+wandb, HAS_WANDB = _import_wandb_safely()
 
 from config.config import Config, TrainingConfig
 from src.models import ModelFactory
@@ -458,22 +503,370 @@ def _extract_hr_hrv_from_sequences(ecg_sequences: np.ndarray, sampling_rate_hz: 
     return hr_values, hrv_values
 
 
+def _parse_recording_uid(recording_uid: str) -> Optional[Tuple[str, str, str]]:
+    """Parse canonical recording IDs like sub-001_ses-01_run-3."""
+    if not recording_uid:
+        return None
+    m = re.match(r"sub-([^_]+)_ses-([^_]+)_run-([^_]+)", str(recording_uid))
+    if m is None:
+        return None
+    return m.group(1), m.group(2), m.group(3)
+
+
+def _interp_to_grid(source_t: np.ndarray, source_v: np.ndarray, target_t: np.ndarray) -> np.ndarray:
+    """1D interpolation with edge fill for dense panel alignment."""
+    st = np.asarray(source_t, dtype=np.float64)
+    sv = np.asarray(source_v, dtype=np.float32)
+    tt = np.asarray(target_t, dtype=np.float64)
+    if st.size == 0 or sv.size == 0 or tt.size == 0:
+        return np.zeros(tt.shape[0], dtype=np.float32)
+
+    order = np.argsort(st)
+    st = st[order]
+    sv = sv[order]
+
+    uniq_t, uniq_idx = np.unique(st, return_index=True)
+    uniq_v = sv[uniq_idx]
+    if uniq_t.size == 1:
+        return np.full(tt.shape[0], float(uniq_v[0]), dtype=np.float32)
+
+    out = np.interp(tt, uniq_t, uniq_v, left=float(uniq_v[0]), right=float(uniq_v[-1]))
+    return out.astype(np.float32)
+
+
+def _extract_hr_hrv_from_dense_ecg(ecg_signal: np.ndarray, sampling_rate_hz: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Estimate continuous HR/HRV arrays from a dense ECG signal."""
+    ecg = np.asarray(ecg_signal, dtype=np.float32)
+    n = ecg.size
+    if n < 5 or sampling_rate_hz <= 0:
+        z = np.zeros(n, dtype=np.float32)
+        return z, z
+
+    centered = ecg - float(np.mean(ecg))
+    std = float(np.std(centered))
+    if std < 1e-6:
+        z = np.zeros(n, dtype=np.float32)
+        return z, z
+
+    threshold = 0.5 * std
+    candidates = np.where(
+        (centered[1:-1] > centered[:-2])
+        & (centered[1:-1] >= centered[2:])
+        & (centered[1:-1] > threshold)
+    )[0] + 1
+
+    min_dist = max(1, int(0.3 * sampling_rate_hz))
+    peaks: List[int] = []
+    for pk in candidates.tolist():
+        if not peaks or (pk - peaks[-1]) >= min_dist:
+            peaks.append(int(pk))
+
+    if len(peaks) < 2:
+        z = np.zeros(n, dtype=np.float32)
+        return z, z
+
+    rr_s = np.diff(peaks).astype(np.float32) / float(sampling_rate_hz)
+    inst_hr = np.clip(60.0 / np.maximum(rr_s, 1e-6), 20.0, 220.0).astype(np.float32)
+
+    inst_hrv = np.zeros_like(inst_hr, dtype=np.float32)
+    for i in range(inst_hrv.size):
+        left = max(0, i - 5)
+        window = rr_s[left:i + 1]
+        inst_hrv[i] = float(np.std(window) * 1000.0) if window.size > 1 else 0.0
+
+    peak_times = (np.asarray(peaks[1:], dtype=np.float32) / float(sampling_rate_hz)).astype(np.float64)
+    full_times = (np.arange(n, dtype=np.float64) / float(sampling_rate_hz)).astype(np.float64)
+    hr = _interp_to_grid(peak_times, inst_hr, full_times)
+    hrv = _interp_to_grid(peak_times, inst_hrv, full_times)
+    return hr.astype(np.float32), hrv.astype(np.float32)
+
+
+def _safe_float(x: float, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _compute_panel_anomaly_report(
+    epoch: int,
+    data_source: str,
+    ecg_signal: np.ndarray,
+    hr_series: np.ndarray,
+    hrv_series: np.ndarray,
+    pred_preictal_prob: np.ndarray,
+    true_countdown: np.ndarray,
+    eeg_signal: Optional[np.ndarray] = None,
+    emg_signal: Optional[np.ndarray] = None,
+    mov_signal: Optional[np.ndarray] = None,
+    token_roll: Optional[np.ndarray] = None,
+) -> Dict[str, object]:
+    """Compute automated panel anomaly checks from epoch visualization inputs."""
+    ecg = np.asarray(ecg_signal, dtype=np.float32)
+    hr = np.asarray(hr_series, dtype=np.float32)
+    hrv = np.asarray(hrv_series, dtype=np.float32)
+    p_alert = np.asarray(pred_preictal_prob, dtype=np.float32)
+    cd = np.asarray(true_countdown, dtype=np.float32)
+
+    finite_ecg = np.isfinite(ecg)
+    if np.any(finite_ecg):
+        ecg_f = ecg[finite_ecg]
+        ecg_std = _safe_float(np.nanstd(ecg_f))
+        ecg_span95 = _safe_float(np.nanpercentile(ecg_f, 95.0) - np.nanpercentile(ecg_f, 5.0))
+        ecg_centered = ecg_f - _safe_float(np.nanmedian(ecg_f))
+        ecg_absmax = _safe_float(np.nanmax(np.abs(ecg_centered)))
+        if ecg.size > 1:
+            diff = np.diff(np.asarray(ecg, dtype=np.float32))
+            dthr = max(1e-6, 0.01 * max(ecg_span95, 1e-6))
+            ecg_near_const_ratio = _safe_float(np.mean(np.abs(diff[np.isfinite(diff)]) < dthr)) if np.any(np.isfinite(diff)) else 1.0
+        else:
+            ecg_near_const_ratio = 1.0
+    else:
+        ecg_std = 0.0
+        ecg_span95 = 0.0
+        ecg_absmax = 0.0
+        ecg_near_const_ratio = 1.0
+
+    finite_hr = np.isfinite(hr)
+    plausible_hr = finite_hr & (hr >= 20.0) & (hr <= 240.0)
+    hr_finite_ratio = _safe_float(np.mean(finite_hr)) if hr.size else 0.0
+    hr_plausible_ratio = _safe_float(np.mean(plausible_hr)) if hr.size else 0.0
+    hr_min = _safe_float(np.nanmin(hr[finite_hr])) if np.any(finite_hr) else 0.0
+    hr_max = _safe_float(np.nanmax(hr[finite_hr])) if np.any(finite_hr) else 0.0
+    hr_std = _safe_float(np.nanstd(hr[finite_hr])) if np.any(finite_hr) else 0.0
+
+    def _mod_stats(arr: Optional[np.ndarray]) -> Dict[str, object]:
+        if arr is None:
+            return {"present": False, "finite_ratio": 0.0, "std": 0.0, "span95": 0.0}
+        v = np.asarray(arr, dtype=np.float32)
+        f = np.isfinite(v)
+        if not np.any(f):
+            return {"present": True, "finite_ratio": 0.0, "std": 0.0, "span95": 0.0}
+        vf = v[f]
+        return {
+            "present": True,
+            "finite_ratio": _safe_float(np.mean(f)),
+            "std": _safe_float(np.nanstd(vf)),
+            "span95": _safe_float(np.nanpercentile(vf, 95.0) - np.nanpercentile(vf, 5.0)),
+        }
+
+    eeg_stats = _mod_stats(eeg_signal)
+    emg_stats = _mod_stats(emg_signal)
+    mov_stats = _mod_stats(mov_signal)
+
+    alert_finite = np.isfinite(p_alert)
+    alert_std = _safe_float(np.nanstd(p_alert[alert_finite])) if np.any(alert_finite) else 0.0
+    alert_mean = _safe_float(np.nanmean(p_alert[alert_finite])) if np.any(alert_finite) else 0.0
+    preictal_ratio = _safe_float(np.mean(cd >= 0.0)) if cd.size else 0.0
+
+    token_stats: Dict[str, object] = {
+        "present": token_roll is not None,
+        "n_channels": 0,
+        "dominant_channel_ratio": 0.0,
+        "normalized_entropy": 0.0,
+        "mean_channel_std": 0.0,
+    }
+    if token_roll is not None:
+        tok = np.asarray(token_roll, dtype=np.float32)
+        if tok.ndim == 2 and tok.shape[0] > 0 and tok.shape[1] > 0:
+            n_ch = int(tok.shape[1])
+            token_stats["n_channels"] = n_ch
+            ch_std = np.nanstd(tok, axis=0)
+            token_stats["mean_channel_std"] = _safe_float(np.nanmean(ch_std))
+            winners = np.argmax(np.nan_to_num(tok, nan=-1e9), axis=1)
+            counts = np.bincount(winners, minlength=n_ch).astype(np.float64)
+            probs = counts / max(1.0, float(np.sum(counts)))
+            dom = float(np.max(probs)) if probs.size else 0.0
+            token_stats["dominant_channel_ratio"] = _safe_float(dom)
+            entropy = -np.sum([p * np.log(p + 1e-12) for p in probs if p > 0.0])
+            token_stats["normalized_entropy"] = _safe_float(entropy / np.log(max(2, n_ch)))
+
+    ds = str(data_source).lower()
+    expected_eeg = ds == 'bids'
+    expected_emg_mov = ds == 'bids'
+
+    anomalies: List[str] = []
+    if ecg_span95 < 1e-3 or ecg_near_const_ratio > 0.985:
+        anomalies.append("ecg_flat_or_near_constant")
+    if hr_finite_ratio > 0.0 and hr_plausible_ratio < 0.50:
+        anomalies.append("bpm_implausible_range")
+    if hr_finite_ratio > 0.0 and hr_std < 1.0:
+        anomalies.append("bpm_low_variability")
+    if expected_eeg and (not eeg_stats["present"] or float(eeg_stats["finite_ratio"]) < 0.50 or float(eeg_stats["span95"]) < 1e-4):
+        anomalies.append("eeg_missing_or_flat")
+    if expected_emg_mov and (not emg_stats["present"] or float(emg_stats["finite_ratio"]) < 0.50 or float(emg_stats["span95"]) < 1e-4):
+        anomalies.append("emg_missing_or_flat")
+    if expected_emg_mov and (not mov_stats["present"] or float(mov_stats["finite_ratio"]) < 0.50 or float(mov_stats["span95"]) < 1e-4):
+        anomalies.append("mov_missing_or_flat")
+    if alert_std < 0.01:
+        anomalies.append("inference_map_low_variance")
+    if token_roll is not None:
+        if float(token_stats["dominant_channel_ratio"]) > 0.95 and float(token_stats["normalized_entropy"]) < 0.20:
+            anomalies.append("token_collapse_dominant_channel")
+
+    return {
+        "epoch": int(epoch),
+        "data_source": str(data_source),
+        "n_samples": int(ecg.size),
+        "summary": {
+            "anomaly_count": int(len(anomalies)),
+            "anomalies": anomalies,
+            "has_anomaly": bool(len(anomalies) > 0),
+        },
+        "expectations": {
+            "eeg_expected": bool(expected_eeg),
+            "emg_expected": bool(expected_emg_mov),
+            "mov_expected": bool(expected_emg_mov),
+        },
+        "metrics": {
+            "ecg_std": ecg_std,
+            "ecg_span95": ecg_span95,
+            "ecg_absmax_centered": ecg_absmax,
+            "ecg_near_const_ratio": ecg_near_const_ratio,
+            "hr_finite_ratio": hr_finite_ratio,
+            "hr_plausible_ratio": hr_plausible_ratio,
+            "hr_min": hr_min,
+            "hr_max": hr_max,
+            "hr_std": hr_std,
+            "hrv_std": _safe_float(np.nanstd(hrv[np.isfinite(hrv)])) if np.any(np.isfinite(hrv)) else 0.0,
+            "pred_alert_mean": alert_mean,
+            "pred_alert_std": alert_std,
+            "gt_preictal_ratio": preictal_ratio,
+        },
+        "modalities": {
+            "eeg": eeg_stats,
+            "emg": emg_stats,
+            "mov": mov_stats,
+        },
+        "token": token_stats,
+    }
+
+
+def _compute_patient_difficulty_summary(
+    pred_preictal: np.ndarray,
+    true_preictal: np.ndarray,
+    pred_countdown: np.ndarray,
+    true_countdown: np.ndarray,
+    patient_ids: np.ndarray,
+    threshold: float,
+    countdown_max_minutes: float,
+    top_k: int = 5,
+) -> Dict[str, object]:
+    """Compute per-patient difficulty ranking from prediction errors."""
+    pred_preictal = np.asarray(pred_preictal, dtype=np.float32)
+    true_preictal = np.asarray(true_preictal, dtype=np.float32)
+    pred_countdown = np.asarray(pred_countdown, dtype=np.float32)
+    true_countdown = np.asarray(true_countdown, dtype=np.float32)
+    patient_ids = np.asarray(patient_ids).astype(str)
+
+    n = len(pred_preictal)
+    if not (n == len(true_preictal) == len(pred_countdown) == len(true_countdown) == len(patient_ids)):
+        return {
+            "n_samples": int(n),
+            "n_patients": 0,
+            "threshold": float(threshold),
+            "patient_rows": [],
+            "hardest_patients": [],
+            "easiest_patients": [],
+        }
+
+    if n == 0:
+        return {
+            "n_samples": 0,
+            "n_patients": 0,
+            "threshold": float(threshold),
+            "patient_rows": [],
+            "hardest_patients": [],
+            "easiest_patients": [],
+        }
+
+    countdown_scale = max(float(countdown_max_minutes), 1e-6)
+    prob_abs_err = np.abs(pred_preictal - true_preictal)
+    preictal_mask = true_countdown >= 0
+    countdown_abs_err = np.abs(pred_countdown - true_countdown)
+    countdown_abs_err_norm = np.zeros_like(countdown_abs_err, dtype=np.float32)
+    countdown_abs_err_norm[preictal_mask] = np.clip(
+        countdown_abs_err[preictal_mask] / countdown_scale,
+        0.0,
+        3.0,
+    )
+    difficulty = 0.65 * prob_abs_err + 0.35 * countdown_abs_err_norm
+
+    pred_binary = (pred_preictal >= float(threshold)).astype(np.int32)
+    true_binary = (true_preictal >= 0.5).astype(np.int32)
+
+    rows: List[Dict[str, object]] = []
+    for patient_id in np.unique(patient_ids):
+        mask = patient_ids == patient_id
+        if not np.any(mask):
+            continue
+        p_true = true_binary[mask]
+        p_pred = pred_binary[mask]
+        tp = int(np.sum((p_true == 1) & (p_pred == 1)))
+        tn = int(np.sum((p_true == 0) & (p_pred == 0)))
+        fp = int(np.sum((p_true == 0) & (p_pred == 1)))
+        fn = int(np.sum((p_true == 1) & (p_pred == 0)))
+        sens = float(tp / max(tp + fn, 1))
+        spec = float(tn / max(tn + fp, 1))
+        bal_acc = 0.5 * (sens + spec)
+
+        p_preictal_mask = preictal_mask[mask]
+        p_countdown_mae = float(np.mean(countdown_abs_err[mask][p_preictal_mask])) if np.any(p_preictal_mask) else None
+
+        rows.append({
+            "patient_id": str(patient_id),
+            "n_samples": int(np.sum(mask)),
+            "n_preictal": int(np.sum(p_true)),
+            "n_interictal": int(np.sum(mask) - np.sum(p_true)),
+            "alert_balanced_accuracy": float(bal_acc),
+            "alert_sensitivity": float(sens),
+            "alert_specificity": float(spec),
+            "mean_prob_abs_error": float(np.mean(prob_abs_err[mask])),
+            "preictal_countdown_mae": p_countdown_mae,
+            "difficulty_score": float(np.mean(difficulty[mask])),
+        })
+
+    rows.sort(key=lambda item: float(item.get("difficulty_score", 0.0)), reverse=True)
+    k = max(1, int(top_k))
+
+    return {
+        "n_samples": int(n),
+        "n_patients": int(len(rows)),
+        "threshold": float(threshold),
+        "patient_rows": rows,
+        "hardest_patients": rows[:k],
+        "easiest_patients": rows[-k:][::-1] if rows else [],
+    }
+
+
 class Trainer:
     """
     Training engine with distributed data parallel support for multi-GPU training.
     """
     
-    def __init__(self, config: Config, device: torch.device = None, use_wandb: bool = True):
+    def __init__(
+        self,
+        config: Config,
+        device: torch.device = None,
+        use_wandb: bool = True,
+        wandb_project: str = "epilepsee-ai",
+        wandb_run_name: str = None,
+    ):
         """Initialize trainer.
         
         Args:
             config: Master Config object
             device: torch device (if None, auto-select based on availability)
             use_wandb: Whether to use Weights & Biases logging
+            wandb_project: Weights & Biases project name
+            wandb_run_name: Optional explicit Weights & Biases run name
         """
         self.config = config
         self.training_config = config.training
         self.use_wandb = use_wandb and HAS_WANDB
+        self.wandb_project = str(wandb_project)
+        self.wandb_run_name = wandb_run_name
         
         # Device setup
         if device is None:
@@ -557,9 +950,17 @@ class Trainer:
         
         try:
             # Initialize wandb run
+            run_name = self.wandb_run_name or f"{self.config.model.model_type}_{int(time.time())}"
+            wandb_mode = os.environ.get('WANDB_MODE', 'online')
+            if wandb_mode not in ('online', 'offline', 'disabled'):
+                wandb_mode = 'online'
+
+            logger.info("Initializing wandb (project=%s, mode=%s)", self.wandb_project, wandb_mode)
+
             self.wandb_run = wandb.init(
-                project="epilepsee-ai",
-                name=f"{self.config.model.model_type}_{int(time.time())}",
+                project=self.wandb_project,
+                name=run_name,
+                mode=wandb_mode,
                 config={
                     "model_type": self.config.model.model_type,
                     "hidden_dim": self.config.model.hidden_dim,
@@ -596,9 +997,42 @@ class Trainer:
             ecg_x = features[:, :, :ecg_dim]
             eeg_x = features[:, :, ecg_dim:ecg_dim + eeg_dim]
             motion_x = features[:, :, ecg_dim + eeg_dim:ecg_dim + eeg_dim + motion_dim]
-            return model(ecg_x, eeg_x, motion_x)
+            outputs = model(ecg_x, eeg_x, motion_x)
+        else:
+            outputs = model(features)
 
-        return model(features)
+        # Support models that may emit auxiliary outputs in addition to
+        # (pre_ictal_pred, countdown_pred).
+        if isinstance(outputs, dict):
+            pre_ictal_pred = (
+                outputs.get('pre_ictal_pred')
+                or outputs.get('classification')
+                or outputs.get('pre_ictal_logits')
+            )
+            countdown_pred = (
+                outputs.get('countdown_pred')
+                or outputs.get('regression')
+                or outputs.get('countdown')
+            )
+            if pre_ictal_pred is None or countdown_pred is None:
+                raise ValueError(
+                    "Model forward dict output must include pre-ictal and countdown tensors. "
+                    f"Available keys: {sorted(outputs.keys())}"
+                )
+            return pre_ictal_pred, countdown_pred
+
+        if isinstance(outputs, (tuple, list)):
+            if len(outputs) < 2:
+                raise ValueError(
+                    "Model forward must return at least two outputs: "
+                    "(pre_ictal_pred, countdown_pred)"
+                )
+            return outputs[0], outputs[1]
+
+        raise ValueError(
+            "Model forward returned unsupported output type. Expected tuple/list/dict with "
+            "pre-ictal and countdown predictions."
+        )
 
     def _progress(self, iterable, desc: str, total: Optional[int] = None):
         """Return tqdm iterator on main process, plain iterable otherwise."""
@@ -806,6 +1240,9 @@ class Trainer:
         num_batches = 0
         all_pred_preictal = []
         all_true_preictal = []
+        all_pred_countdown = []
+        all_true_countdown = []
+        all_patient_ids = []
         
         # Update sampler for distributed training
         if hasattr(train_loader.sampler, 'set_epoch'):
@@ -819,6 +1256,111 @@ class Trainer:
 
         # Track last gradient norm for debugging numerical issues
         last_grad_norm: Optional[float] = None
+
+        # Optimizer step scheduling:
+        # - batch: step every batch (legacy behavior)
+        # - patient: step when patient ID boundary is crossed
+        # - patients_group: step every N patient boundaries
+        step_scope_raw = str(getattr(self.training_config, 'optimizer_step_scope', 'batch')).lower()
+        if step_scope_raw == 'n_patients':
+            # Backward-compatible alias if old configs use this spelling.
+            step_scope_raw = 'patients_group'
+        valid_step_scopes = {'batch', 'patient', 'patients_group'}
+        step_scope = step_scope_raw if step_scope_raw in valid_step_scopes else 'batch'
+        patients_per_step = max(1, int(getattr(self.training_config, 'patients_per_step', 1)))
+        grouped_patient_mode = (step_scope == 'patients_group') and (patients_per_step > 1)
+
+        # Resolve per-sample patient IDs if available (required for boundary stepping).
+        patient_ids: Optional[np.ndarray] = None
+        if step_scope != 'batch':
+            dataset_obj = train_loader.dataset
+            base_dataset = getattr(dataset_obj, '_dataset', dataset_obj)
+            if hasattr(base_dataset, 'subject_ids'):
+                try:
+                    if hasattr(dataset_obj, '_dataset') and hasattr(dataset_obj, '_offset') and hasattr(dataset_obj, '_buf_size'):
+                        start = int(dataset_obj._offset)
+                        stop = start + int(dataset_obj._buf_size)
+                        patient_ids = np.atleast_1d(np.asarray(base_dataset.subject_ids[start:stop]))
+                    else:
+                        patient_ids = np.atleast_1d(np.asarray(base_dataset.subject_ids))
+                    if patient_ids.ndim == 0 or len(patient_ids) == 0:
+                        patient_ids = None
+                        step_scope = 'batch'
+                except Exception as exc:
+                    if self._is_main_process():
+                        logger.warning(
+                            "Failed to read subject_ids for patient-level stepping; falling back to batch stepping: %s",
+                            exc,
+                        )
+                    step_scope = 'batch'
+            else:
+                if self._is_main_process():
+                    logger.warning(
+                        "optimizer_step_scope=%s requested but dataset has no subject_ids; falling back to batch stepping.",
+                        step_scope,
+                    )
+                step_scope = 'batch'
+
+        # Track boundary state for patient/group stepping.
+        current_patient_id: Optional[object] = None
+        patients_accumulated_for_step = 0
+        batches_since_step = 0
+        optimizer_steps = 0
+        self._last_train_patient_summary = None
+
+        optimizer.zero_grad()
+
+        def _sanitize_clip_step(step_batch_idx: int) -> Optional[float]:
+            """Apply gradient safety checks, optional clipping, and optimizer step."""
+            nonlocal optimizer_steps
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if param.grad is None or param.grad.data.numel() == 0:
+                        continue
+                    if not torch.isfinite(param.grad).all():
+                        clean_grad = torch.nan_to_num(
+                            param.grad,
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                        )
+                        clean_grad = torch.clamp(clean_grad, -1000.0, 1000.0)
+                        logger.error(
+                            "Non-finite gradient detected; sanitizing before optimizer step "
+                            f"(epoch={epoch}, batch={step_batch_idx}, param={name}, "
+                            f"max_abs={float(clean_grad.abs().max()):.4e})"
+                        )
+                        param.grad.copy_(clean_grad)
+
+            step_grad_norm: Optional[float] = None
+            if self.training_config.gradient_clip_norm > 0:
+                step_grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        self.training_config.gradient_clip_norm
+                    )
+                )
+
+            optimizer.step()
+            optimizer_steps += 1
+
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if param is None or param.data.numel() == 0:
+                        continue
+                    if not torch.isfinite(param.data).all():
+                        clean = torch.nan_to_num(param.data)
+                        logger.error(
+                            "Non-finite parameter after optimizer step "
+                            f"(epoch={epoch}, batch={step_batch_idx}, param={name}, "
+                            f"min={float(clean.min()):.4e}, max={float(clean.max()):.4e})"
+                        )
+                        raise RuntimeError(
+                            "Non-finite model parameters encountered after optimizer step; "
+                            "aborting training. See logs for diagnostics."
+                        )
+
+            return step_grad_norm
 
         for batch_idx, batch in train_iter:
             # Move data to device
@@ -868,62 +1410,65 @@ class Trainer:
                     logger.error(" | ".join(msg_parts))
                 raise RuntimeError("Non-finite loss encountered; aborting training. See logs for diagnostics.")
             
-            # Backward pass
-            optimizer.zero_grad()
+            # Backward pass (step timing depends on configured scope)
             loss_dict['total'].backward()
 
-            # Sanitize gradients to avoid propagating NaNs/Infs into
-            # optimizer state. This is a last line of defence in case
-            # some rare batch produces unstable gradients while the
-            # forward pass and loss remain finite.
-            with torch.no_grad():
-                for name, param in model.named_parameters():
-                    if param.grad is None or param.grad.data.numel() == 0:
-                        continue
-                    if not torch.isfinite(param.grad).all():
-                        clean_grad = torch.nan_to_num(
-                            param.grad,
-                            nan=0.0,
-                            posinf=0.0,
-                            neginf=0.0,
-                        )
-                        # Optionally clamp extremely large cleaned gradients
-                        clean_grad = torch.clamp(clean_grad, -1000.0, 1000.0)
-                        logger.error(
-                            "Non-finite gradient detected; sanitizing before optimizer step "
-                            f"(epoch={epoch}, batch={batch_idx}, param={name}, "
-                            f"max_abs={float(clean_grad.abs().max()):.4e})"
-                        )
-                        param.grad.copy_(clean_grad)
+            batch_size = int(labels.shape[0])
+            sample_start = int(batch_idx) * int(train_loader.batch_size)
+            sample_end = min(sample_start + batch_size, len(train_loader.dataset))
+            batch_patient_ids = None
+            if patient_ids is not None and sample_start < len(patient_ids):
+                batch_patient_ids = patient_ids[sample_start:sample_end]
 
-            # Gradient clipping (also capture norm for optional logging)
-            if self.training_config.gradient_clip_norm > 0:
-                last_grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        self.training_config.gradient_clip_norm
-                    )
-                )
-            
-            optimizer.step()
+            do_step_now = False
+            if step_scope == 'batch':
+                do_step_now = True
+            else:
+                if patient_ids is None or sample_start >= len(patient_ids):
+                    do_step_now = True
+                else:
+                    if batch_patient_ids.size == 0:
+                        do_step_now = True
+                    else:
+                        first_patient = batch_patient_ids[0]
+                        if current_patient_id is None:
+                            current_patient_id = first_patient
+                            patients_accumulated_for_step = 1
+                        elif first_patient != current_patient_id:
+                            current_patient_id = first_patient
+                            patients_accumulated_for_step += 1
 
-            # Sanity-check model parameters after optimizer step to catch
-            # the earliest sign of numerical instability (NaNs/Infs).
-            with torch.no_grad():
-                for name, param in model.named_parameters():
-                    if param is None or param.data.numel() == 0:
-                        continue
-                    if not torch.isfinite(param.data).all():
-                        clean = torch.nan_to_num(param.data)
-                        logger.error(
-                            "Non-finite parameter after optimizer step "
-                            f"(epoch={epoch}, batch={batch_idx}, param={name}, "
-                            f"min={float(clean.min()):.4e}, max={float(clean.max()):.4e})"
-                        )
-                        raise RuntimeError(
-                            "Non-finite model parameters encountered after optimizer step; "
-                            "aborting training. See logs for diagnostics."
-                        )
+                        if step_scope == 'patient':
+                            next_sample_start = sample_end
+                            is_last_batch = (batch_idx + 1) >= len(train_loader)
+                            if is_last_batch:
+                                do_step_now = True
+                            elif next_sample_start < len(patient_ids):
+                                next_patient = patient_ids[next_sample_start]
+                                if next_patient != current_patient_id:
+                                    do_step_now = True
+                        elif step_scope == 'patients_group':
+                            next_sample_start = sample_end
+                            is_last_batch = (batch_idx + 1) >= len(train_loader)
+                            boundary_after_batch = False
+                            if is_last_batch:
+                                boundary_after_batch = True
+                            elif next_sample_start < len(patient_ids):
+                                next_patient = patient_ids[next_sample_start]
+                                boundary_after_batch = (next_patient != current_patient_id)
+
+                            if boundary_after_batch and patients_accumulated_for_step >= patients_per_step:
+                                do_step_now = True
+                            elif is_last_batch:
+                                do_step_now = True
+
+            batches_since_step += 1
+            if do_step_now:
+                last_grad_norm = _sanitize_clip_step(batch_idx)
+                optimizer.zero_grad()
+                batches_since_step = 0
+                if grouped_patient_mode and step_scope == 'patients_group':
+                    patients_accumulated_for_step = 0
             
             # Accumulate metrics
             num_batches += 1
@@ -931,6 +1476,10 @@ class Trainer:
                 metrics[f'train_{key}'] += float(value.detach().cpu())
             all_pred_preictal.extend(pre_ictal_pred.detach().cpu().numpy())
             all_true_preictal.extend(pre_ictal_labels.detach().cpu().numpy())
+            all_pred_countdown.extend(countdown_pred.detach().cpu().numpy())
+            all_true_countdown.extend(labels.detach().cpu().numpy())
+            if batch_patient_ids is not None and len(batch_patient_ids) == batch_size:
+                all_patient_ids.extend(batch_patient_ids.tolist())
             
             # Log batch
             if batch_idx % self.training_config.log_interval == 0 and self._is_main_process():
@@ -949,6 +1498,7 @@ class Trainer:
                     train_iter.set_postfix({
                         "loss": f"{avg_loss:.4f}",
                         "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                        "steps": optimizer_steps,
                     })
                 
                 # Log to wandb
@@ -958,6 +1508,7 @@ class Trainer:
                             "batch": batch_idx,
                             "train/batch_loss": avg_loss,
                             "train/learning_rate": optimizer.param_groups[0]['lr'],
+                            "train/optimizer_steps": optimizer_steps,
                         }
                         if last_grad_norm is not None:
                             log_payload["train/grad_norm"] = last_grad_norm
@@ -971,6 +1522,29 @@ class Trainer:
             'pred_preictal': np.array(all_pred_preictal, dtype=np.float32),
             'true_preictal': np.array(all_true_preictal, dtype=np.float32),
         }
+
+        if len(all_patient_ids) == len(all_pred_preictal) and len(all_patient_ids) > 0:
+            patient_summary = _compute_patient_difficulty_summary(
+                pred_preictal=np.array(all_pred_preictal, dtype=np.float32),
+                true_preictal=np.array(all_true_preictal, dtype=np.float32),
+                pred_countdown=np.array(all_pred_countdown, dtype=np.float32),
+                true_countdown=np.array(all_true_countdown, dtype=np.float32),
+                patient_ids=np.asarray(all_patient_ids),
+                threshold=float(self.config.loss.detection_threshold),
+                countdown_max_minutes=float(self.config.model.output_countdown_max),
+                top_k=5,
+            )
+            self._last_train_patient_summary = patient_summary
+
+            hardest = patient_summary.get('hardest_patients', [])
+            easiest = patient_summary.get('easiest_patients', [])
+            if hardest:
+                metrics['train_hardest_patient_difficulty'] = float(hardest[0].get('difficulty_score', 0.0))
+                metrics['train_hardest_patient_bal_acc'] = float(hardest[0].get('alert_balanced_accuracy', 0.0))
+            if easiest:
+                metrics['train_easiest_patient_difficulty'] = float(easiest[0].get('difficulty_score', 0.0))
+                metrics['train_easiest_patient_bal_acc'] = float(easiest[0].get('alert_balanced_accuracy', 0.0))
+            metrics['train_patient_count'] = float(patient_summary.get('n_patients', 0))
         
         return dict(metrics), train_viz_payload
     
@@ -1280,6 +1854,7 @@ class Trainer:
         # aligned. This lets epoch panels show contiguous segments from a
         # single recording rather than shuffled samples across recordings.
         val_dataset = getattr(val_loader, 'dataset', None)
+        self._cached_val_dataset_ref = val_dataset
         sample_end_times_s = getattr(val_dataset, 'sample_end_times_s', None) if val_dataset is not None else None
         recording_ids = getattr(val_dataset, 'recording_ids', None) if val_dataset is not None else None
         if (
@@ -1326,7 +1901,7 @@ class Trainer:
         # of many independent windows.
         time_axis_minutes: Optional[np.ndarray]
         if 'sample_end_times_s' in viz_payload and 'recording_ids' in viz_payload:
-            panel_window_minutes = float(getattr(self.training_config, 'epoch_panel_window_minutes', 180.0))
+            panel_window_minutes = float(getattr(self.training_config, 'epoch_panel_window_minutes', 60.0))
             preferred_recording = getattr(self.training_config, 'epoch_panel_preferred_recording', None)
             selected, time_axis_minutes = _select_panel_indices_with_metadata(
                 true_countdown,
@@ -1396,6 +1971,9 @@ class Trainer:
             if pred_state_full is not None and len(pred_state_full) == len(viz_payload['pred_preictal'])
             else None
         )
+        pred_preictal_smooth_sel = viz_payload.get('pred_preictal_smooth')
+        if pred_preictal_smooth_sel is not None:
+            pred_preictal_smooth_sel = pred_preictal_smooth_sel[selected]
 
         # Keep raw proxies for any downstream numeric use.
         ecg_proxy_raw = ecg_proxy[selected]
@@ -1405,18 +1983,175 @@ class Trainer:
         adxl_proxy_raw = adxl_proxy[selected] if adxl_proxy is not None and len(adxl_proxy) == len(ecg_proxy) else None
         hr_proxy_raw = hr_proxy[selected]
         hrv_proxy_raw = hrv_proxy[selected]
+        emg_proxy_raw: Optional[np.ndarray] = None
+        mov_proxy_raw: Optional[np.ndarray] = None
+
+        # Rebuild a dense timeline (default 1 Hz) for metadata-backed BIDS
+        # panels so overlays do not look sparsely sampled when validation
+        # windows were uniformly subsampled per recording.
+        rec_ids_meta = viz_payload.get('recording_ids')
+        times_meta = viz_payload.get('sample_end_times_s')
+        if (
+            getattr(self.config.data, 'data_source', 'bids') != 'wearable'
+            and rec_ids_meta is not None
+            and times_meta is not None
+            and len(rec_ids_meta) == len(viz_payload['true_countdown'])
+            and len(times_meta) == len(viz_payload['true_countdown'])
+            and len(selected) >= 2
+        ):
+            rec_ids_all = np.asarray(rec_ids_meta)
+            times_all = np.asarray(times_meta, dtype=np.float64)
+            rec_ids_sel = rec_ids_all[selected]
+            times_sel = times_all[selected]
+
+            uniq_rec, counts = np.unique(rec_ids_sel, return_counts=True)
+            chosen_rec = str(uniq_rec[int(np.argmax(counts))]) if uniq_rec.size > 0 else None
+            if chosen_rec is not None:
+                keep = rec_ids_sel == chosen_rec
+                if np.any(keep):
+                    sel_local = selected[keep]
+                    t_local = np.asarray(times_all[sel_local], dtype=np.float64)
+                    order = np.argsort(t_local)
+                    sel_local = sel_local[order]
+                    t_local = t_local[order]
+
+                    dense_step_s = float(max(0.5, getattr(self.training_config, 'epoch_panel_dense_step_s', 1.0)))
+                    dense_t = np.arange(float(t_local[0]), float(t_local[-1]) + dense_step_s * 0.5, dense_step_s, dtype=np.float64)
+
+                    if dense_t.size >= 8:
+                        # Interpolate predictions/targets to the dense timeline.
+                        pred_preictal = _interp_to_grid(t_local, viz_payload['pred_preictal'][sel_local], dense_t)
+                        true_countdown = _interp_to_grid(t_local, viz_payload['true_countdown'][sel_local], dense_t)
+                        pred_countdown = _interp_to_grid(t_local, viz_payload['pred_countdown'][sel_local], dense_t)
+                        true_preictal = (true_countdown >= 0.0).astype(np.float32)
+
+                        if pred_preictal_smooth_sel is not None:
+                            pred_preictal_smooth_sel = _interp_to_grid(
+                                t_local,
+                                np.asarray(pred_preictal_smooth_sel, dtype=np.float32)[keep][order],
+                                dense_t,
+                            )
+
+                        if pred_onset_prob is not None:
+                            pred_onset_prob = _interp_to_grid(t_local, np.asarray(pred_onset_prob, dtype=np.float32)[keep][order], dense_t)
+                        if pred_preictal_only_prob is not None:
+                            pred_preictal_only_prob = _interp_to_grid(
+                                t_local,
+                                np.asarray(pred_preictal_only_prob, dtype=np.float32)[keep][order],
+                                dense_t,
+                            )
+                        if true_state is not None:
+                            true_state = np.rint(_interp_to_grid(t_local, np.asarray(true_state, dtype=np.float32)[keep][order], dense_t)).astype(np.int32)
+                        if pred_state is not None:
+                            pred_state = np.rint(_interp_to_grid(t_local, np.asarray(pred_state, dtype=np.float32)[keep][order], dense_t)).astype(np.int32)
+
+                        # Start from interpolated proxies, then override with
+                        # dense raw streams when available.
+                        ecg_proxy_raw = _interp_to_grid(t_local, np.asarray(ecg_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                        ppg_proxy_raw = _interp_to_grid(t_local, np.asarray(ppg_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                        if eda_proxy_raw is not None:
+                            eda_proxy_raw = _interp_to_grid(t_local, np.asarray(eda_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                        if eeg_proxy_raw is not None:
+                            eeg_proxy_raw = _interp_to_grid(t_local, np.asarray(eeg_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                        if adxl_proxy_raw is not None:
+                            adxl_proxy_raw = _interp_to_grid(t_local, np.asarray(adxl_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                        hr_proxy_raw = _interp_to_grid(t_local, np.asarray(hr_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                        hrv_proxy_raw = _interp_to_grid(t_local, np.asarray(hrv_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+
+                        # Use cached ECG binary when available in LazyRealDataset metadata.
+                        try:
+                            val_dataset_obj = getattr(self, '_cached_val_dataset_ref', None)
+                            recordings_meta = getattr(val_dataset_obj, 'recordings_meta', None)
+                            if recordings_meta is None:
+                                recordings_meta = viz_payload.get('recordings_meta')
+                            if recordings_meta is not None:
+                                for meta in recordings_meta:
+                                    if str(meta.get('recording_uid', '')) == chosen_rec:
+                                        fs = float(meta.get('fs', 0.0))
+                                        n_samples = int(meta.get('n_samples', 0))
+                                        signal_path = str(meta.get('signal_path', ''))
+                                        if fs > 0 and n_samples > 0 and signal_path:
+                                            dense_idx = np.clip((dense_t * fs).astype(np.int64), 0, n_samples - 1)
+                                            sig = np.memmap(signal_path, dtype=np.float32, mode='r', shape=(n_samples,))
+                                            ecg_proxy_raw = np.asarray(sig[dense_idx], dtype=np.float32)
+
+                                            # Compute HR/HRV from a raw-rate ECG segment (not from
+                                            # the 1 Hz display-downsampled signal), then sample those
+                                            # trajectories to the dense display grid.
+                                            seg_margin = max(1, int(10.0 * fs))
+                                            seg_start = max(0, int(dense_idx.min()) - seg_margin)
+                                            seg_end = min(n_samples, int(dense_idx.max()) + seg_margin + 1)
+                                            ecg_segment = np.asarray(sig[seg_start:seg_end], dtype=np.float32)
+                                            if ecg_segment.size >= 8:
+                                                hr_seg, hrv_seg = _extract_hr_hrv_from_dense_ecg(ecg_segment, fs)
+                                                local_idx = np.clip(dense_idx - seg_start, 0, hr_seg.shape[0] - 1)
+                                                hr_proxy_raw = np.asarray(hr_seg[local_idx], dtype=np.float32)
+                                                hrv_proxy_raw = np.asarray(hrv_seg[local_idx], dtype=np.float32)
+                                        break
+                        except Exception as dense_ecg_exc:
+                            logger.debug('Dense ECG panel rebuild skipped for %s: %s', chosen_rec, str(dense_ecg_exc))
+
+                        # Try loading EEG/EMG/MOV from BIDS streams for the
+                        # same recording to keep modality overlays visible.
+                        try:
+                            parsed = _parse_recording_uid(chosen_rec)
+                            if parsed is not None:
+                                from src.data_loader import BIDSDataLoader as _BIDSLoader
+
+                                sub_id, ses_id, run_id = parsed
+                                panel_loader = _BIDSLoader(self.config.data)
+
+                                def _load_dense_modality(datatype: str) -> Optional[np.ndarray]:
+                                    try:
+                                        data, fs_local = panel_loader.load_subject_edf(sub_id, ses_id, datatype, run_id)
+                                        if data is None:
+                                            return None
+                                        arr = data[0] if np.asarray(data).ndim > 1 else np.asarray(data)
+                                        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+                                        if arr.size == 0 or fs_local <= 0:
+                                            return None
+                                        idx = np.clip((dense_t * float(fs_local)).astype(np.int64), 0, arr.shape[0] - 1)
+                                        return np.asarray(arr[idx], dtype=np.float32)
+                                    except Exception:
+                                        return None
+
+                                eeg_raw = _load_dense_modality('eeg')
+                                emg_raw = _load_dense_modality('emg')
+                                mov_raw = _load_dense_modality('mov')
+
+                                if eeg_raw is not None:
+                                    eeg_proxy_raw = eeg_raw
+                                if emg_raw is not None:
+                                    emg_proxy_raw = emg_raw
+                                if mov_raw is not None:
+                                    mov_proxy_raw = mov_raw
+
+                                if emg_proxy_raw is not None or mov_proxy_raw is not None:
+                                    parts = []
+                                    if emg_proxy_raw is not None:
+                                        parts.append(_standardize_for_plot(np.abs(emg_proxy_raw - float(np.mean(emg_proxy_raw)))))
+                                    if mov_proxy_raw is not None:
+                                        parts.append(_standardize_for_plot(mov_proxy_raw))
+                                    if len(parts) == 1:
+                                        adxl_proxy_raw = parts[0]
+                                    elif len(parts) >= 2:
+                                        adxl_proxy_raw = (0.65 * parts[0] + 0.35 * parts[1]).astype(np.float32)
+                        except Exception as dense_modal_exc:
+                            logger.debug('Dense EEG/EMG/MOV panel rebuild skipped for %s: %s', chosen_rec, str(dense_modal_exc))
+
+                        time_axis_minutes = ((dense_t - float(dense_t[0])) / 60.0).astype(np.float64)
+                        panel_sampling_rate_hz = 1.0 / max(dense_step_s, 1e-6)
 
         # For wearable runs, show a z-scored heart-rate proxy as the top
         # "Signal" trace (so that the HR subplot can display the raw bpm
-        # values separately). For BIDS ECG runs we standardize the ECG proxy
-        # for contrast.
+        # values separately). For BIDS ECG runs, keep the primary trace raw.
         if getattr(self.config.data, "data_source", "bids") == "wearable":
             ecg_proxy_plot = _standardize_for_plot(ppg_proxy_raw)
         else:
-            ecg_proxy_plot = _standardize_for_plot(ecg_proxy_raw)
+            ecg_proxy_plot = ecg_proxy_raw.astype(np.float32)
         ppg_proxy_plot = _standardize_for_plot(ppg_proxy_raw)
         eda_proxy_plot = _standardize_for_plot(eda_proxy_raw) if eda_proxy_raw is not None else None
-        eeg_proxy_plot = _standardize_for_plot(eeg_proxy_raw) if eeg_proxy_raw is not None else None
+        eeg_proxy_plot = eeg_proxy_raw.astype(np.float32) if eeg_proxy_raw is not None else None
         adxl_proxy_plot = adxl_proxy_raw if adxl_proxy_raw is not None else None
         # For wearable runs, keep HR/HRV proxies in their synthetic
         # physiological units so that plots show meaningful ranges instead of
@@ -1429,11 +2164,115 @@ class Trainer:
             else:
                 hrv_proxy_plot = hrv_proxy_raw.astype(np.float32)
         else:
-            hr_proxy_plot = _standardize_for_plot(hr_proxy_raw)
-            hrv_proxy_plot = _standardize_for_plot(hr_proxy_raw if np.allclose(hrv_proxy_raw, 0.0) else hrv_proxy_raw)
-        pred_preictal_smooth_sel = viz_payload.get('pred_preictal_smooth')
-        if pred_preictal_smooth_sel is not None:
-            pred_preictal_smooth_sel = pred_preictal_smooth_sel[selected]
+            hr_proxy_plot = hr_proxy_raw.astype(np.float32)
+            hrv_proxy_plot = (hr_proxy_raw if np.allclose(hrv_proxy_raw, 0.0) else hrv_proxy_raw).astype(np.float32)
+
+        # Runtime/local inference accuracy using local history only.
+        gt_binary = (true_countdown >= 0).astype(np.float32)
+        panel_alarm_prob = (
+            np.asarray(pred_preictal_smooth_sel, dtype=np.float32)
+            if pred_preictal_smooth_sel is not None
+            else np.asarray(pred_preictal, dtype=np.float32)
+        )
+        pred_binary = (panel_alarm_prob >= float(self.config.loss.detection_threshold)).astype(np.float32)
+        acc_window = max(3, int(getattr(self.training_config, 'epoch_panel_accuracy_window', 31)))
+        local_accuracy = np.zeros_like(gt_binary, dtype=np.float32)
+        for i in range(len(local_accuracy)):
+            left = max(0, i - acc_window + 1)
+            local_accuracy[i] = float(np.mean((pred_binary[left:i + 1] == gt_binary[left:i + 1]).astype(np.float32)))
+
+        gt_event_mask = np.zeros_like(gt_binary, dtype=np.int32)
+        if len(gt_binary) > 0:
+            gt_event_mask[0] = int(gt_binary[0] > 0)
+        if len(gt_binary) > 1:
+            gt_event_mask[1:] = ((gt_binary[1:] > 0) & (gt_binary[:-1] <= 0)).astype(np.int32)
+        # Build token activation waterfall from longitudinal causal channels
+        # so token rows reflect temporal digestion, not static bucket IDs.
+        token_roll = None
+        token_labels: Optional[List[str]] = None
+        token_window = max(1, int(getattr(self.training_config, 'token_waterfall_window', 25)))
+        try:
+            alert = np.clip(pred_preictal.astype(np.float32), 0.0, 1.0)
+            alert_smooth = np.clip(
+                pred_preictal_smooth_sel.astype(np.float32) if pred_preictal_smooth_sel is not None else alert,
+                0.0,
+                1.0,
+            )
+            d_alert = np.zeros_like(alert, dtype=np.float32)
+            if alert.size > 1:
+                d_alert[1:] = alert[1:] - alert[:-1]
+
+            # Causal streak of above-threshold alertness.
+            thr = float(self.config.loss.detection_threshold)
+            streak = np.zeros_like(alert, dtype=np.float32)
+            run = 0
+            for i, p in enumerate(alert):
+                run = run + 1 if p >= thr else 0
+                streak[i] = float(run)
+            streak_norm = np.clip(streak / max(1.0, float(token_window)), 0.0, 1.0)
+
+            # Countdown-head imminent risk in [0, 1] for non-state mode.
+            pred_cd = np.asarray(pred_countdown, dtype=np.float32)
+            tau_min = max(0.5, float(np.nanpercentile(np.clip(true_countdown[true_countdown >= 0], 0.0, None), 50)) if np.any(true_countdown >= 0) else 2.0)
+            imminent = np.clip(np.exp(-np.clip(pred_cd, 0.0, None) / tau_min), 0.0, 1.0)
+
+            channels: List[np.ndarray] = [
+                alert,
+                alert_smooth,
+                np.clip((alert - 0.2) / 0.8, 0.0, 1.0),
+                np.clip((alert - 0.5) / 0.5, 0.0, 1.0),
+                np.clip((alert - 0.8) / 0.2, 0.0, 1.0),
+                np.clip(np.maximum(d_alert, 0.0) / 0.10, 0.0, 1.0),
+                np.clip(np.maximum(-d_alert, 0.0) / 0.10, 0.0, 1.0),
+                streak_norm,
+                np.asarray(local_accuracy, dtype=np.float32) if 'local_accuracy' in locals() else np.zeros_like(alert),
+                imminent,
+            ]
+            labels: List[str] = [
+                'Alert Raw',
+                'Alert Smoothed',
+                'Alert Low+',
+                'Alert Med+',
+                'Alert High+',
+                'Alert Rising',
+                'Alert Falling',
+                'Alert Persistence',
+                'Local Accuracy',
+                'Imminent Risk',
+            ]
+
+            if state_mode and pred_onset_prob is not None and pred_preictal_only_prob is not None:
+                onset = np.clip(np.asarray(pred_onset_prob, dtype=np.float32), 0.0, 1.0)
+                pre_only = np.clip(np.asarray(pred_preictal_only_prob, dtype=np.float32), 0.0, 1.0)
+                d_onset = np.zeros_like(onset, dtype=np.float32)
+                if onset.size > 1:
+                    d_onset[1:] = onset[1:] - onset[:-1]
+                channels.extend([
+                    pre_only,
+                    onset,
+                    np.clip(np.maximum(d_onset, 0.0) / 0.10, 0.0, 1.0),
+                ])
+                labels.extend([
+                    'Preictal Head',
+                    'Onset Head',
+                    'Onset Rising',
+                ])
+
+            channel_mat = np.stack(channels, axis=1).astype(np.float32)
+
+            # Causal rolling average per channel to make token flow visibly longitudinal.
+            token_roll = np.zeros_like(channel_mat)
+            for col in range(channel_mat.shape[1]):
+                c = channel_mat[:, col]
+                for i in range(c.shape[0]):
+                    left = max(0, i - token_window + 1)
+                    token_roll[i, col] = float(np.mean(c[left:i + 1]))
+
+            token_labels = labels
+        except Exception as token_exc:
+            logger.warning('Token activation build skipped for epoch %d: %s', int(epoch), str(token_exc))
+            token_roll = None
+            token_labels = None
 
         panel_threshold = _select_detection_threshold(
             viz_payload['true_countdown'],
@@ -1450,7 +2289,7 @@ class Trainer:
         data_source = getattr(self.config.data, "data_source", "bids")
         signal_label = viz_payload.get(
             'signal_label',
-            'ECG proxy' if data_source != "wearable" else "PPG proxy",
+            'ECG raw amplitude + BPM' if data_source != "wearable" else "PPG proxy",
         )
 
         # Human-readable dataset tag for figure titles/footers.
@@ -1469,7 +2308,7 @@ class Trainer:
         )
         rec_ids_meta = viz_payload.get('recording_ids')
         times_meta = viz_payload.get('sample_end_times_s')
-        if rec_ids_meta is not None and times_meta is not None and len(rec_ids_meta) == len(true_countdown):
+        if rec_ids_meta is not None and times_meta is not None and len(rec_ids_meta) == len(viz_payload['true_countdown']):
             rec_ids_meta = np.asarray(rec_ids_meta)
             times_meta = np.asarray(times_meta, dtype=np.float64)
             rec_ids_panel = rec_ids_meta[selected]
@@ -1494,6 +2333,8 @@ class Trainer:
             ppg_signal=ppg_proxy_plot,
             eda_signal=eda_proxy_plot,
             eeg_signal=eeg_proxy_plot,
+            emg_signal=emg_proxy_raw,
+            mov_signal=mov_proxy_raw,
             adxl_series=adxl_proxy_plot,
             hr_series=hr_proxy_plot,
             hrv_series=hrv_proxy_plot,
@@ -1516,11 +2357,59 @@ class Trainer:
             gt_onset=None if true_state is None else (true_state == 2).astype(np.int32),
             gt_preictal_only=None if true_state is None else (true_state == 1).astype(np.int32),
             visualization_mode='state' if state_mode else 'countdown',
+            token_roll=token_roll,
+            token_window=token_window,
+            token_labels=token_labels,
+            local_accuracy=local_accuracy,
+            gt_event_mask=gt_event_mask,
+            data_source=data_source,
         )
-        self.epoch_visualizer.save_figure(fig_panel, f"epoch_{epoch:03d}_gt_vs_inference_panel", step=epoch)
+        panel_filename = f"epoch_{epoch:03d}_gt_vs_inference_panel"
+        self.epoch_visualizer.save_figure(fig_panel, panel_filename, step=epoch)
 
-        # Log interactive per-epoch timeline table so W&B can zoom into
-        # long-duration traces (hours) beyond static PNG panels.
+        # Automated anomaly checks for panel inputs; persist machine-readable
+        # reports so run health can be monitored without manual figure review.
+        try:
+            anomaly_report = _compute_panel_anomaly_report(
+                epoch=int(epoch),
+                data_source=str(data_source),
+                ecg_signal=np.asarray(ecg_proxy_plot, dtype=np.float32),
+                hr_series=np.asarray(hr_proxy_plot, dtype=np.float32),
+                hrv_series=np.asarray(hrv_proxy_plot, dtype=np.float32),
+                pred_preictal_prob=np.asarray(pred_preictal, dtype=np.float32),
+                true_countdown=np.asarray(true_countdown, dtype=np.float32),
+                eeg_signal=None if eeg_proxy_plot is None else np.asarray(eeg_proxy_plot, dtype=np.float32),
+                emg_signal=None if emg_proxy_raw is None else np.asarray(emg_proxy_raw, dtype=np.float32),
+                mov_signal=None if mov_proxy_raw is None else np.asarray(mov_proxy_raw, dtype=np.float32),
+                token_roll=None if token_roll is None else np.asarray(token_roll, dtype=np.float32),
+            )
+
+            monitor_dir = self.save_dir / "monitoring"
+            monitor_dir.mkdir(parents=True, exist_ok=True)
+
+            epoch_report_path = monitor_dir / f"epoch_{int(epoch):03d}_anomaly_report.json"
+            with open(epoch_report_path, "w", encoding="utf-8") as fh:
+                json.dump(anomaly_report, fh, indent=2, sort_keys=True)
+
+            jsonl_path = monitor_dir / "anomaly_reports.jsonl"
+            with open(jsonl_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(anomaly_report, sort_keys=True) + "\n")
+
+            anomalies = anomaly_report.get("summary", {}).get("anomalies", [])
+            if anomalies:
+                logger.warning(
+                    "Epoch %d anomaly flags: %s | report=%s",
+                    int(epoch),
+                    ",".join([str(a) for a in anomalies]),
+                    str(epoch_report_path),
+                )
+            else:
+                logger.info("Epoch %d anomaly checks: clean | report=%s", int(epoch), str(epoch_report_path))
+        except Exception as anomaly_exc:
+            logger.warning("Epoch %d anomaly checks failed: %s", int(epoch), str(anomaly_exc))
+
+
+        # Log interactive per-epoch timeline table and main panel to W&B
         if self.wandb_run is not None and HAS_WANDB:
             try:
                 if time_axis_minutes is None:
@@ -1589,69 +2478,15 @@ class Trainer:
                             int(true_countdown[i] >= 0),
                         )
 
+                # Log both the main panel and the table
                 log_payload = {
                     'visualizations/epoch_timeseries_table': table,
                     'visualizations/epoch': int(epoch),
+                    'visualizations/gt_vs_inference_panel': wandb.Image(str(self.save_dir / 'epoch_visualizations' / f'{panel_filename}.png')),
                 }
 
-                # Token waterfall explainability artifact (epoch-level).
-                try:
-                    n_countdown_bins = int(getattr(self.training_config, 'token_countdown_bins', 8))
-                    n_prob_bins = int(getattr(self.training_config, 'token_prob_bins', 4))
-                    token_window = max(1, int(getattr(self.training_config, 'token_waterfall_window', 25)))
-
-                    if state_mode and pred_onset_prob is not None:
-                        alert_prob = np.clip(pred_preictal.astype(np.float32), 0.0, 0.999999)
-                        onset_prob_sel = np.clip(pred_onset_prob.astype(np.float32), 0.0, 0.999999)
-                        alert_bin = np.minimum((alert_prob * n_prob_bins).astype(np.int32), n_prob_bins - 1)
-                        onset_bin = np.minimum((onset_prob_sel * n_prob_bins).astype(np.int32), n_prob_bins - 1)
-                        token_id = alert_bin * n_prob_bins + onset_bin
-                        token_total = n_prob_bins * n_prob_bins
-                    else:
-                        max_countdown = max(10.0, float(np.max(np.clip(true_countdown, 0.0, None))))
-                        pred_prob = np.clip(pred_preictal.astype(np.float32), 0.0, 0.999999)
-                        pred_cd = pred_countdown.astype(np.float32)
-
-                        countdown_bin = np.zeros_like(pred_cd, dtype=np.int32)
-                        pre_mask = pred_cd >= 0.0
-                        if np.any(pre_mask):
-                            frac = np.clip(pred_cd[pre_mask] / max_countdown, 0.0, 0.999999)
-                            countdown_bin[pre_mask] = 1 + np.minimum((frac * n_countdown_bins).astype(np.int32), n_countdown_bins - 1)
-
-                        prob_bin = np.minimum((pred_prob * n_prob_bins).astype(np.int32), n_prob_bins - 1)
-                        token_id = countdown_bin * n_prob_bins + prob_bin
-                        token_total = (n_countdown_bins + 1) * n_prob_bins
-
-                    one_hot = np.zeros((len(token_id), token_total), dtype=np.float32)
-                    one_hot[np.arange(len(token_id)), np.clip(token_id, 0, token_total - 1)] = 1.0
-
-                    kernel = np.ones(token_window, dtype=np.float32) / float(token_window)
-                    token_roll = np.zeros_like(one_hot)
-                    for col in range(one_hot.shape[1]):
-                        token_roll[:, col] = np.convolve(one_hot[:, col], kernel, mode='same')
-
-                    import matplotlib.pyplot as _plt
-                    fig_tw, ax_tw = _plt.subplots(figsize=(12, 4))
-                    im = ax_tw.imshow(
-                        token_roll.T,
-                        aspect='auto',
-                        origin='lower',
-                        interpolation='nearest',
-                        cmap='magma',
-                    )
-                    waterfall_title = 'State Token Waterfall' if state_mode else 'Token Waterfall'
-                    ax_tw.set_title(f'{waterfall_title} (epoch {int(epoch):03d}, window={token_window})')
-                    ax_tw.set_xlabel('Sample index')
-                    ax_tw.set_ylabel('Token ID')
-                    fig_tw.colorbar(im, ax=ax_tw, fraction=0.03, pad=0.01, label='Rolling occupancy')
-
-                    token_path = self.save_dir / 'epoch_visualizations' / f'epoch_{int(epoch):03d}_token_waterfall.png'
-                    fig_tw.savefig(token_path, dpi=160, bbox_inches='tight')
-                    _plt.close(fig_tw)
-
-                    log_payload['visualizations/token_waterfall'] = wandb.Image(str(token_path))
-                except Exception as token_exc:
-                    logger.warning('Failed to generate/log token waterfall for epoch %d: %s', int(epoch), str(token_exc))
+                if token_roll is not None:
+                    log_payload['visualizations/token_activation_enabled'] = 1
 
                 try:
                     alert_metrics = _compute_binary_metrics(
@@ -1666,9 +2501,29 @@ class Trainer:
                     fig_alert_cm = _build_confusion_matrix_figure(
                         alert_cm,
                         ('Interictal', 'Alert'),
-                        f'Alert confusion matrix | epoch {int(epoch):03d}',
+                        f'Alert confusion matrix (raw) | epoch {int(epoch):03d}',
                     )
-                    log_payload['visualizations/alert_confusion_matrix'] = wandb.Image(fig_alert_cm)
+                    log_payload['visualizations/alert_confusion_matrix_raw'] = wandb.Image(fig_alert_cm)
+
+                    smooth_probs = np.asarray(viz_payload.get('pred_preictal_smooth', viz_payload['pred_preictal']), dtype=np.float32)
+                    smooth_metrics = _compute_binary_metrics(
+                        (viz_payload['true_countdown'] >= 0).astype(np.int32),
+                        smooth_probs,
+                        float(self.config.loss.detection_threshold),
+                    )
+                    smooth_cm = np.array([
+                        [int(smooth_metrics['tn']), int(smooth_metrics['fp'])],
+                        [int(smooth_metrics['fn']), int(smooth_metrics['tp'])],
+                    ], dtype=np.int32)
+                    fig_smooth_cm = _build_confusion_matrix_figure(
+                        smooth_cm,
+                        ('Interictal', 'Alert'),
+                        f'Alert confusion matrix (smoothed) | epoch {int(epoch):03d}',
+                    )
+                    log_payload['visualizations/alert_confusion_matrix_smoothed'] = wandb.Image(fig_smooth_cm)
+
+                    log_payload['visualizations/alert_balanced_accuracy_raw'] = float(alert_metrics['balanced_accuracy'])
+                    log_payload['visualizations/alert_balanced_accuracy_smoothed'] = float(smooth_metrics['balanced_accuracy'])
 
                     if state_mode and 'state_confusion_matrix' in viz_payload:
                         fig_state_cm = _build_confusion_matrix_figure(
@@ -1815,6 +2670,44 @@ class Trainer:
                 history['val_mae_pct_change'].append(pct_mae)
                 history['learning_rates'].append(optimizer.param_groups[0]['lr'])
 
+                patient_summary = getattr(self, '_last_train_patient_summary', None)
+                if isinstance(patient_summary, dict) and patient_summary.get('n_patients', 0) > 0:
+                    monitor_dir = self.save_dir / "monitoring"
+                    monitor_dir.mkdir(parents=True, exist_ok=True)
+
+                    patient_epoch_payload = {
+                        'epoch': int(epoch),
+                        'summary': patient_summary,
+                    }
+                    patient_epoch_path = monitor_dir / f"epoch_{int(epoch):03d}_patient_difficulty.json"
+                    with open(patient_epoch_path, "w", encoding="utf-8") as fh:
+                        json.dump(patient_epoch_payload, fh, indent=2, sort_keys=True)
+
+                    patient_jsonl_path = monitor_dir / "patient_difficulty_reports.jsonl"
+                    with open(patient_jsonl_path, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(patient_epoch_payload, sort_keys=True) + "\n")
+
+                    hardest = patient_summary.get('hardest_patients', [])
+                    easiest = patient_summary.get('easiest_patients', [])
+                    if hardest:
+                        logger.info(
+                            "Epoch %d hardest patient: %s | difficulty=%.4f | bal_acc=%.4f | n=%d",
+                            int(epoch),
+                            str(hardest[0].get('patient_id', 'unknown')),
+                            float(hardest[0].get('difficulty_score', 0.0)),
+                            float(hardest[0].get('alert_balanced_accuracy', 0.0)),
+                            int(hardest[0].get('n_samples', 0)),
+                        )
+                    if easiest:
+                        logger.info(
+                            "Epoch %d easiest patient: %s | difficulty=%.4f | bal_acc=%.4f | n=%d",
+                            int(epoch),
+                            str(easiest[0].get('patient_id', 'unknown')),
+                            float(easiest[0].get('difficulty_score', 0.0)),
+                            float(easiest[0].get('alert_balanced_accuracy', 0.0)),
+                            int(easiest[0].get('n_samples', 0)),
+                        )
+
                 # Update previous metrics for next epoch comparison
                 prev_train_loss = train_loss
                 prev_val_loss = val_loss
@@ -1860,6 +2753,19 @@ class Trainer:
                         log_payload["val/loss_delta_pct"] = pct_val
                     if pct_mae is not None:
                         log_payload["val/mae_delta_pct"] = pct_mae
+
+                    if isinstance(patient_summary, dict) and patient_summary.get('n_patients', 0) > 0:
+                        hardest = patient_summary.get('hardest_patients', [])
+                        easiest = patient_summary.get('easiest_patients', [])
+                        log_payload["train/patient_count"] = float(patient_summary.get('n_patients', 0))
+                        if hardest:
+                            log_payload["train/hardest_patient_difficulty"] = float(hardest[0].get('difficulty_score', 0.0))
+                            log_payload["train/hardest_patient_balanced_accuracy"] = float(hardest[0].get('alert_balanced_accuracy', 0.0))
+                            log_payload["train/hardest_patient_preictal_countdown_mae"] = float(hardest[0].get('preictal_countdown_mae', 0.0) or 0.0)
+                        if easiest:
+                            log_payload["train/easiest_patient_difficulty"] = float(easiest[0].get('difficulty_score', 0.0))
+                            log_payload["train/easiest_patient_balanced_accuracy"] = float(easiest[0].get('alert_balanced_accuracy', 0.0))
+                            log_payload["train/easiest_patient_preictal_countdown_mae"] = float(easiest[0].get('preictal_countdown_mae', 0.0) or 0.0)
 
                     wandb.log(log_payload)
                 

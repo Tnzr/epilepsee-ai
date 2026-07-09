@@ -1,3 +1,32 @@
+# Latest Turn-In Update (2026-07-04)
+
+- Dense multimodal panel + integrated token activation work is documented in:
+   - `documentation/Research-Dev/TURN_IN_REPORT_PANELFIX_2026-07-04.md`
+- Main patched long run output directory:
+   - `models/seizeit2_tcn_longrun_e12_panelfix/`
+- Sanity validation output directory:
+   - `models/seizeit2_tcn_sanity_panelfix_e1/`
+
+# Latest Training Validation Update (2026-07-08)
+
+- Completed a strict 2-epoch DDP run on SeizeIT2 using `config/wearable_tcn.yaml` with wandb online.
+- Epoch 2 completed full training and validation successfully before post-training test evaluation began.
+- Final validation metrics:
+   - `Train Loss: 7.5822`
+   - `Val Loss: 11.3642`
+   - `Val MAE: 4.1048 min`
+- Saved runtime artifacts:
+   - `models/epoch_visualizations/epoch_002_gt_vs_inference_panel.png`
+   - `models/monitoring/epoch_002_anomaly_report.json`
+   - `models/best_model.pt`
+   - `models/last_model.pt`
+   - `models/training_history.json`
+- Post-validation failure root cause was a model-output unpacking mismatch in `src/evaluation.py`; this has been fixed.
+- Additional methodology changes were implemented before the next full run:
+   - onset-aware class balancing,
+   - onset-focused temporal weighting,
+   - raw-vs-smoothed alert confusion diagnostics.
+
 # ✅ Execution Summary - PPG Visualizer with All-Signals
 
 ## What You Asked For

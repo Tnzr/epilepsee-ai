@@ -3,10 +3,24 @@ Configuration management for seizure anticipation project.
 Centralized settings for data, model, training, and evaluation.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import List, Dict, Optional
 import yaml
 import os
+import logging
+
+
+logger = logging.getLogger(__name__)
+
+
+def _filter_dataclass_kwargs(dataclass_type, raw_values: Dict) -> Dict:
+    """Keep only keys accepted by a dataclass constructor.
+
+    This allows loading older/newer YAML files without hard failures when
+    unknown keys are present.
+    """
+    valid_names = {f.name for f in fields(dataclass_type)}
+    return {k: v for k, v in raw_values.items() if k in valid_names}
 
 
 @dataclass
@@ -15,7 +29,7 @@ class DataConfig:
     
     # Dataset paths — override via env vars BIDS_DATASET_ROOT / WEARABLE_DATASET_ROOT
     # or by passing --dataset-root on the CLI.
-    dataset_root: str = field(default_factory=lambda: os.environ.get('BIDS_DATASET_ROOT', 'data/ds005873'))
+    dataset_root: str = field(default_factory=lambda: os.environ.get('BIDS_DATASET_ROOT', 'data/SeizeIT2'))
     output_dir: str = field(default_factory=lambda: os.environ.get('OUTPUT_DIR', './data'))
     
     # BIDS structure
@@ -82,6 +96,8 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
+    # Temporal coherence (UNet-style head connection)
+    coherent_heads: bool = True
     """Neural network architecture configuration."""
     
     # Input dimensions
@@ -154,6 +170,16 @@ class LossConfig:
     
     # Time-based weighting
     weight_tau: float = 60.0  # seconds (exponential time constant)
+
+    # Additional temporal emphasis for samples closer to annotated onset.
+    # These multipliers are applied on top of the existing class weighting
+    # and regression sample weights so the model receives stronger signal
+    # precisely where alert timing matters most.
+    temporal_focus_tau_min: float = 5.0
+    classification_temporal_boost: float = 1.5
+    classification_temporal_max_multiplier: float = 4.0
+    regression_temporal_boost: float = 0.5
+    regression_temporal_max_multiplier: float = 3.0
     
     # Label smoothing
     label_smoothing: float = 0.0
@@ -161,6 +187,9 @@ class LossConfig:
     # Classification imbalance handling
     use_class_weighting: bool = True
     classification_positive_weight: Optional[float] = None
+    # Legacy alias from older configs; mapped into classification_positive_weight
+    max_positive_weight: Optional[float] = None
+    onset_positive_weight_boost: float = 1.5
 
     # Classification loss type and focal parameters.
     # "bce"   → standard BCE (optionally class-weighted)
@@ -175,6 +204,7 @@ class LossConfig:
 
 @dataclass
 class TrainingConfig:
+    """Training loop configuration."""
     """Training loop configuration."""
     
     # Optimization
@@ -194,10 +224,17 @@ class TrainingConfig:
     batch_size: int = 32
     num_workers: int = 4
     pin_memory: bool = True
-    
+
     # Gradient handling
     gradient_clip_norm: float = 1.0
     gradient_accumulation_steps: int = 1
+
+    # Optimizer step scheduling for longitudinal patient-sequential training.
+    # - batch:          optimizer.step() every batch (default behavior)
+    # - patient:        accumulate gradients and step when patient ID changes
+    # - patients_group: accumulate across N consecutive patients, then step
+    optimizer_step_scope: str = "batch"  # "batch" | "patient" | "patients_group"
+    patients_per_step: int = 1
 
     # Sampling strategy (non-distributed only). By default we rely on
     # loss-level class weighting and temporal weighting rather than a
@@ -210,30 +247,44 @@ class TrainingConfig:
     # iterate in timeline order within each split.
     long_sweep_training: bool = False
 
-    # Epoch panel visualization window (minutes). Set to >=180 for longitudinal
-    # wearable context in both local files and W&B image logging.
-    epoch_panel_window_minutes: float = 180.0
-    
+    # Epoch panel visualization window (minutes). Default 60 gives a focused
+    # onset-centered context (~-30/+30) for clearer interpretation.
+    epoch_panel_window_minutes: float = 60.0
+
     # Early stopping
     early_stopping: bool = True
     early_stopping_patience: int = 15
     early_stopping_metric: str = "val_mae"
-    
+
     # Distributed training (Multi-GPU)
     distributed: bool = True
     num_gpus: int = 2
     backend: str = "nccl"  # "nccl" for GPU, "gloo" for CPU
-    
+
     # Checkpointing
-    save_dir: str = field(default_factory=lambda: os.environ.get('OUTPUT_DIR', './models'))
     save_interval: int = 5  # Save every N epochs
     save_best_only: bool = True
     resume_from: Optional[str] = None
-    
+
     # Logging
-    log_dir: str = field(default_factory=lambda: os.path.join(os.environ.get('OUTPUT_DIR', '.'), 'logs'))
     log_interval: int = 100  # Log every N batches
     use_tensorboard: bool = True
+
+    # Preferred recording for epoch panel visualizations (e.g., patient 2)
+    epoch_panel_preferred_recording: Optional[str] = None
+
+    # Stateful LSTM training (patient-sequential batching)
+    training_mode: str = "stateful"  # "stateful" or "stateless"
+    batching_strategy: str = "patient_sequential"  # "patient_sequential" or "random"
+    
+    # Stateful LSTM parameters
+    hidden_state_detach_interval: int = 10  # Detach hidden state every N batches
+    max_patient_sequence_length: int = 10000  # Max samples per patient
+    reset_hidden_between_epochs: bool = False  # Reset hidden state between epochs?
+
+    # Fields with default_factory must come last (required by dataclasses)
+    save_dir: str = field(default_factory=lambda: os.environ.get('OUTPUT_DIR', './models'))
+    log_dir: str = field(default_factory=lambda: os.path.join(os.environ.get('OUTPUT_DIR', '.'), 'logs'))
 
 
 @dataclass
@@ -264,6 +315,11 @@ class EvaluationConfig:
     # Cross-validation
     compute_loso_cv: bool = True
     num_cv_folds: Optional[int] = None  # If None, use all seizures (full LOSO)
+
+    # Longitudinal Bayesian memory simulation over timeline metadata.
+    # Keep enabled by default for real-world streaming evaluation, but allow
+    # disabling for ablation studies.
+    enable_bayesian_memory_eval: bool = True
 
 
 @dataclass
@@ -298,15 +354,47 @@ class Config:
         config = cls()
         
         if 'data' in config_dict:
-            config.data = DataConfig(**config_dict['data'])
+            data_raw = dict(config_dict['data'])
+            filtered = _filter_dataclass_kwargs(DataConfig, data_raw)
+            unknown = sorted(set(data_raw.keys()) - set(filtered.keys()))
+            if unknown:
+                logger.warning("Ignoring unknown data config keys: %s", ", ".join(unknown))
+            config.data = DataConfig(**filtered)
         if 'model' in config_dict:
-            config.model = ModelConfig(**config_dict['model'])
+            model_raw = dict(config_dict['model'])
+            filtered = _filter_dataclass_kwargs(ModelConfig, model_raw)
+            unknown = sorted(set(model_raw.keys()) - set(filtered.keys()))
+            if unknown:
+                logger.warning("Ignoring unknown model config keys: %s", ", ".join(unknown))
+            config.model = ModelConfig(**filtered)
         if 'loss' in config_dict:
-            config.loss = LossConfig(**config_dict['loss'])
+            loss_raw = dict(config_dict['loss'])
+            # Backward compatibility for legacy key naming.
+            if (
+                'classification_positive_weight' not in loss_raw
+                and 'max_positive_weight' in loss_raw
+            ):
+                loss_raw['classification_positive_weight'] = loss_raw['max_positive_weight']
+
+            filtered = _filter_dataclass_kwargs(LossConfig, loss_raw)
+            unknown = sorted(set(loss_raw.keys()) - set(filtered.keys()))
+            if unknown:
+                logger.warning("Ignoring unknown loss config keys: %s", ", ".join(unknown))
+            config.loss = LossConfig(**filtered)
         if 'training' in config_dict:
-            config.training = TrainingConfig(**config_dict['training'])
+            training_raw = dict(config_dict['training'])
+            filtered = _filter_dataclass_kwargs(TrainingConfig, training_raw)
+            unknown = sorted(set(training_raw.keys()) - set(filtered.keys()))
+            if unknown:
+                logger.warning("Ignoring unknown training config keys: %s", ", ".join(unknown))
+            config.training = TrainingConfig(**filtered)
         if 'evaluation' in config_dict:
-            config.evaluation = EvaluationConfig(**config_dict['evaluation'])
+            eval_raw = dict(config_dict['evaluation'])
+            filtered = _filter_dataclass_kwargs(EvaluationConfig, eval_raw)
+            unknown = sorted(set(eval_raw.keys()) - set(filtered.keys()))
+            if unknown:
+                logger.warning("Ignoring unknown evaluation config keys: %s", ", ".join(unknown))
+            config.evaluation = EvaluationConfig(**filtered)
         
         if 'experiment_name' in config_dict:
             config.experiment_name = config_dict['experiment_name']

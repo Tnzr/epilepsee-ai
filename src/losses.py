@@ -69,6 +69,35 @@ class SeizureCountdownLoss(nn.Module):
         self.use_class_weighting = getattr(config, 'use_class_weighting', False)
         self.classification_positive_weight = getattr(config, 'classification_positive_weight', None)
         self.max_positive_weight = float(getattr(config, 'max_positive_weight', 200.0))
+        self.onset_positive_weight_boost = float(getattr(config, 'onset_positive_weight_boost', 1.0))
+        self.temporal_focus_tau_min = float(getattr(config, 'temporal_focus_tau_min', 5.0))
+        self.classification_temporal_boost = float(getattr(config, 'classification_temporal_boost', 0.0))
+        self.classification_temporal_max_multiplier = float(
+            getattr(config, 'classification_temporal_max_multiplier', 4.0)
+        )
+        self.regression_temporal_boost = float(getattr(config, 'regression_temporal_boost', 0.0))
+        self.regression_temporal_max_multiplier = float(
+            getattr(config, 'regression_temporal_max_multiplier', 3.0)
+        )
+
+    def _temporal_multiplier(
+        self,
+        countdown_true: torch.Tensor,
+        boost: float,
+        max_multiplier: float,
+    ) -> torch.Tensor:
+        """Return onset-aware per-sample weights in [1, max_multiplier]."""
+        if boost <= 0.0:
+            return torch.ones_like(countdown_true, dtype=torch.float32)
+
+        tau_min = max(self.temporal_focus_tau_min, 1e-3)
+        active_mask = (countdown_true >= 0.0).float()
+        clipped_countdown = torch.clamp(countdown_true, min=0.0)
+        proximity = torch.exp(-clipped_countdown / tau_min)
+        multiplier = 1.0 + active_mask * boost * proximity
+        if max_multiplier > 1.0:
+            multiplier = torch.clamp(multiplier, max=float(max_multiplier))
+        return multiplier
     
     def forward(self, pre_ictal_pred: torch.Tensor, countdown_pred: torch.Tensor,
                 pre_ictal_true: torch.Tensor, countdown_true: torch.Tensor,
@@ -90,11 +119,19 @@ class SeizureCountdownLoss(nn.Module):
         # log(0) → inf inside BCE when the model saturates.
         pred = torch.clamp(pre_ictal_pred, 1e-6, 1 - 1e-6)
 
+        class_temporal_multiplier = self._temporal_multiplier(
+            countdown_true,
+            self.classification_temporal_boost,
+            self.classification_temporal_max_multiplier,
+        )
+
         if self.classification_loss_type == "focal":
             # Focal loss variant for heavy imbalance. Class weighting is
             # encoded via focal_alpha in the config rather than
             # per-batch pos_weight.
-            bce_loss = self.focal_loss(pred, pre_ictal_true)
+            focal_per_sample = self.focal_loss(pred, pre_ictal_true, reduction='none')
+            weighted_focal = focal_per_sample * class_temporal_multiplier
+            bce_loss = torch.sum(weighted_focal) / (torch.sum(class_temporal_multiplier) + 1e-8)
         elif self.use_class_weighting:
             if self.classification_positive_weight is not None:
                 pos_weight = torch.tensor(
@@ -107,15 +144,23 @@ class SeizureCountdownLoss(nn.Module):
                 neg_count = torch.sum(1.0 - pre_ictal_true)
                 pos_weight = (neg_count + 1e-6) / (pos_count + 1e-6)
 
+            if self.onset_positive_weight_boost > 1.0:
+                onset_mask = (countdown_true >= 0.0) & (countdown_true < self.temporal_focus_tau_min)
+                if torch.any(onset_mask):
+                    pos_weight = pos_weight * float(self.onset_positive_weight_boost)
+
             pos_weight = torch.clamp(pos_weight, min=1.0, max=self.max_positive_weight)
 
             bce_per_sample = -(
                 pos_weight * pre_ictal_true * torch.log(pred)
                 + (1.0 - pre_ictal_true) * torch.log(1.0 - pred)
             )
-            bce_loss = torch.mean(bce_per_sample)
+            weighted_bce = bce_per_sample * class_temporal_multiplier
+            bce_loss = torch.sum(weighted_bce) / (torch.sum(class_temporal_multiplier) + 1e-8)
         else:
-            bce_loss = self.bce_loss(pred, pre_ictal_true)
+            bce_per_sample = F.binary_cross_entropy(pred, pre_ictal_true, reduction='none')
+            weighted_bce = bce_per_sample * class_temporal_multiplier
+            bce_loss = torch.sum(weighted_bce) / (torch.sum(class_temporal_multiplier) + 1e-8)
         
         # 2. Regression loss: Weighted MSE (only on preictal samples)
         # Create mask that zeros out interictal samples but keeps gradients flowing
@@ -128,11 +173,17 @@ class SeizureCountdownLoss(nn.Module):
             raw_loss = self.regression_loss(countdown_pred, countdown_true)
         
         # Apply preictal mask and sample weights (zeros out interictal, emphasizes late preictal)
-        weighted_loss = raw_loss * preictal_mask * sample_weights
+        regression_temporal_multiplier = self._temporal_multiplier(
+            countdown_true,
+            self.regression_temporal_boost,
+            self.regression_temporal_max_multiplier,
+        )
+        regression_weights = preictal_mask * sample_weights * regression_temporal_multiplier
+        weighted_loss = raw_loss * regression_weights
         
         # Normalize by number of preictal samples (avoid division by zero)
-        num_preictal = torch.sum(preictal_mask) + 1e-8
-        regression_loss = torch.sum(weighted_loss) / num_preictal
+        regression_norm = torch.sum(regression_weights) + 1e-8
+        regression_loss = torch.sum(weighted_loss) / regression_norm
         
         # 3. Ranking loss: Penalize if countdown increases (should decrease over time)
         ranking_loss = self._compute_ranking_loss(countdown_pred, countdown_true)
@@ -237,7 +288,7 @@ class FocalLoss(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
     
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, reduction: str = 'mean') -> torch.Tensor:
         """Compute focal loss.
         
         Args:
@@ -260,6 +311,10 @@ class FocalLoss(nn.Module):
         focal_weight = (1.0 - p_t) ** self.gamma
 
         focal_loss = -alpha_t * focal_weight * torch.log(p_t)
+        if reduction == 'none':
+            return focal_loss
+        if reduction == 'sum':
+            return focal_loss.sum()
         return focal_loss.mean()
 
 

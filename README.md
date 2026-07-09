@@ -21,12 +21,26 @@ Epilepsee-AI is a production-ready deep learning framework for predicting seizur
 - ✅ **Comprehensive Evaluation** - Regression metrics, clinical metrics, stability analysis
 - ✅ **Full OOP Architecture** - Modular, extensible, production-grade code
 
+**Methodology updates in active training pipeline (2026-07-08):**
+- DDP-safe onset-aware class balancing: positive-class pressure is increased near annotated onset instead of relying on a distributed sampler.
+- Temporal loss emphasis near onset: both classification and regression losses receive additional per-sample weighting as countdown approaches zero.
+- Dual alert diagnostics: training logs now emit separate raw-alert and smoothed-alert confusion matrices so flat head behavior can be distinguished from post-processing effects.
+
+**Latest verified 2-epoch DDP run on SeizeIT2 (TCN, online wandb):**
+- Epoch-2 training completed, validation completed, and artifacts were saved successfully.
+- Final epoch-2 metrics: Train Loss `7.5822`, Val Loss `11.3642`, Val MAE `4.1048 min`.
+- Saved outputs include `epoch_002_gt_vs_inference_panel.png`, `epoch_002_anomaly_report.json`, `best_model.pt`, `last_model.pt`, and `training_history.json`.
+- The observed post-training failure occurred in test evaluation output unpacking and has been fixed in `src/evaluation.py`.
+
 **Performance (Expected on SeizeIT2 - 886 seizures):**
 | Model | MAE | Sensitivity @ 5min | FPR | Training Time |
 |-------|-----|-------------------|-----|---------------|
 | ECG LSTM | 1.2 min | 78% | 1.2/8h | 2-4 hours |
 | CNN-LSTM | 0.9 min | 85% | 0.8/8h | 6-8 hours |
 | Multimodal | 0.7 min | 88% | 0.6/8h | 8-10 hours |
+
+**Deployment readiness reference:**
+- Real-world smartwatch integration checklist: [documentation/REAL_WORLD_WATCH_DEPLOYMENT_CHECKLIST.md](documentation/REAL_WORLD_WATCH_DEPLOYMENT_CHECKLIST.md)
 
 ---
 

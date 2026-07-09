@@ -375,6 +375,34 @@ Auxiliary losses:
 L = L_alert + λ L_onset + γ L_aux
 ```
 
+### 4.2.1 Imbalance Handling and Onset-Focused Optimization
+
+For highly imbalanced longitudinal seizure data, a plain global class weight is
+often insufficient: the model can still learn a visually flat alert trajectory
+ with low-amplitude noise spikes, especially when onset-region samples are rare.
+
+The active methodology therefore adds three training-time controls:
+
+1. **Onset-aware positive-class pressure**
+   - Keep a global positive-class weight for preictal scarcity.
+   - Add a modest extra boost when onset-proximal samples are present so the
+     alert head is explicitly pushed to separate urgent windows from the
+     dominant interictal background.
+
+2. **Temporal weighting near annotated onset**
+   - Introduce capped per-sample multipliers for both classification and
+     regression heads.
+   - The multiplier grows as countdown approaches zero, making late mistakes
+     more expensive than distant preictal errors.
+
+3. **Raw-vs-smoothed alert diagnostics**
+   - During validation, compute confusion matrices for both the raw alert head
+     and the causally smoothed operating signal.
+   - This separates two failure modes:
+     - the base head is flat and non-discriminative, or
+     - the base head is usable but the post-processing/thresholding pipeline is
+       masking behavior in diagnostic media.
+
 ---
 
 ## 4.3 Multi-Task Learning

@@ -117,9 +117,40 @@ class Evaluator:
             ecg_x = features[:, :, :ecg_dim]
             eeg_x = features[:, :, ecg_dim:ecg_dim + eeg_dim]
             motion_x = features[:, :, ecg_dim + eeg_dim:ecg_dim + eeg_dim + motion_dim]
-            return model(ecg_x, eeg_x, motion_x)
+            outputs = model(ecg_x, eeg_x, motion_x)
+        else:
+            outputs = model(features)
 
-        return model(features)
+        if isinstance(outputs, dict):
+            pre_ictal_pred = None
+            countdown_pred = None
+            for key in ('pre_ictal_pred', 'classification', 'pre_ictal_logits'):
+                if key in outputs and outputs[key] is not None:
+                    pre_ictal_pred = outputs[key]
+                    break
+            for key in ('countdown_pred', 'regression', 'countdown'):
+                if key in outputs and outputs[key] is not None:
+                    countdown_pred = outputs[key]
+                    break
+            if pre_ictal_pred is None or countdown_pred is None:
+                raise ValueError(
+                    "Model forward dict output must include pre-ictal and countdown tensors. "
+                    f"Available keys: {sorted(outputs.keys())}"
+                )
+            return pre_ictal_pred, countdown_pred
+
+        if isinstance(outputs, (tuple, list)):
+            if len(outputs) < 2:
+                raise ValueError(
+                    "Model forward must return at least two outputs: "
+                    "(pre_ictal_pred, countdown_pred)"
+                )
+            return outputs[0], outputs[1]
+
+        raise ValueError(
+            "Model forward returned unsupported output type. Expected tuple/list/dict with "
+            "pre-ictal and countdown predictions."
+        )
     
     def evaluate(self, model: torch.nn.Module, dataset: SeizureDataset,
                 device: torch.device) -> Dict[str, float]:
@@ -194,6 +225,34 @@ class Evaluator:
         
         # Stability metrics
         metrics['prediction_stability'] = self._compute_stability(all_pred_countdown)
+
+        # Longitudinal Bayesian memory metrics (when timeline metadata exists).
+        sample_end_times_s = getattr(dataset, 'sample_end_times_s', None)
+        recording_ids = getattr(dataset, 'recording_ids', None)
+        bayes_enabled = bool(getattr(self.eval_config, 'enable_bayesian_memory_eval', True))
+        if bayes_enabled and sample_end_times_s is not None and recording_ids is not None:
+            try:
+                times_arr = np.asarray(sample_end_times_s, dtype=np.float64)
+                rec_arr = np.asarray(recording_ids).astype(str)
+                if len(times_arr) == len(all_true_countdown) and len(rec_arr) == len(all_true_countdown):
+                    bayes_payload = self.simulate_bayesian_long_sweep(
+                        pred_preictal=all_pred_preictal,
+                        pred_countdown=all_pred_countdown,
+                        true_countdown=all_true_countdown,
+                        sample_end_times_s=times_arr,
+                        recording_ids=rec_arr,
+                    )
+                    metrics.update(bayes_payload.get('metrics', {}))
+                else:
+                    logger.warning(
+                        "Skipping Bayesian memory metrics due to metadata length mismatch "
+                        "(pred=%d, times=%d, rec=%d)",
+                        len(all_true_countdown),
+                        len(times_arr),
+                        len(rec_arr),
+                    )
+            except Exception as bayes_error:
+                logger.warning("Bayesian memory metrics skipped due to error: %s", str(bayes_error))
         
         return metrics
 
@@ -232,13 +291,22 @@ class Evaluator:
         true_countdown = np.array(all_true_countdown)
         pred_preictal = np.array(all_pred_preictal, dtype=np.float32)
         pred_preictal_smooth = causal_smooth_predictions(pred_preictal)
-        return {
+        payload = {
             "pred_preictal": pred_preictal,
             "pred_preictal_smooth": pred_preictal_smooth,
             "pred_countdown": np.array(all_pred_countdown),
             "true_preictal": (true_countdown >= 0).astype(np.int32),
             "true_countdown": true_countdown,
         }
+
+        sample_end_times_s = getattr(dataset, 'sample_end_times_s', None)
+        recording_ids = getattr(dataset, 'recording_ids', None)
+        if sample_end_times_s is not None:
+            payload['sample_end_times_s'] = np.asarray(sample_end_times_s, dtype=np.float64)
+        if recording_ids is not None:
+            payload['recording_ids'] = np.asarray(recording_ids).astype(str)
+
+        return payload
 
     @staticmethod
     def _compute_ece(pred: np.ndarray, true: np.ndarray, n_bins: int = 10) -> float:
@@ -753,7 +821,7 @@ class Evaluator:
         Returns:
             Median prediction std over windows
         """
-        if len(pred) < window:
+        if len(pred) <= window:
             return 0.0
         
         stabilities = []
@@ -761,6 +829,9 @@ class Evaluator:
             window_std = np.std(pred[i:i+window])
             stabilities.append(window_std)
         
+        if len(stabilities) == 0:
+            return 0.0
+
         return float(np.median(stabilities))
     
     def print_results(self, metrics: Dict[str, float]) -> None:
