@@ -14,6 +14,7 @@ import json
 import re
 import logging
 import importlib
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -86,6 +87,12 @@ from src.models import ModelFactory
 from src.losses import LossFactory
 from src.data_loader import SeizureDataset
 from src.visualization import SignalVisualizer
+from src.stateful_data_loader import (
+    TemporalPatientSequenceDataLoader,
+    HiddenStateManager,
+    IndexedTemporalDatasetView,
+    partition_patients_by_batch_count,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -979,7 +986,20 @@ class Trainer:
             logger.warning(f"wandb initialization failed: {str(e)}")
             self.wandb_run = None
 
-    def _forward_model(self, model: nn.Module, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _use_stateful_training(self) -> bool:
+        return (
+            str(getattr(self.training_config, 'training_mode', 'stateless')).lower() == 'stateful'
+            and str(getattr(self.training_config, 'batching_strategy', 'random')).lower() == 'patient_sequential'
+            and str(self.config.model.model_type).lower() == 'ecg_lstm'
+        )
+
+    def _forward_model(
+        self,
+        model: nn.Module,
+        features: torch.Tensor,
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_hidden_state: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass wrapper handling single-modal and multimodal inputs."""
         from src.models import ModelFactory as _MF
 
@@ -999,7 +1019,12 @@ class Trainer:
             motion_x = features[:, :, ecg_dim + eeg_dim:ecg_dim + eeg_dim + motion_dim]
             outputs = model(ecg_x, eeg_x, motion_x)
         else:
-            outputs = model(features)
+            if hidden_state is not None:
+                outputs = model(features, hidden_state)
+            else:
+                outputs = model(features)
+
+        next_hidden_state = None
 
         # Support models that may emit auxiliary outputs in addition to
         # (pre_ictal_pred, countdown_pred).
@@ -1019,6 +1044,8 @@ class Trainer:
                     "Model forward dict output must include pre-ictal and countdown tensors. "
                     f"Available keys: {sorted(outputs.keys())}"
                 )
+            if return_hidden_state:
+                return pre_ictal_pred, countdown_pred, outputs.get('hidden_state')
             return pre_ictal_pred, countdown_pred
 
         if isinstance(outputs, (tuple, list)):
@@ -1027,12 +1054,60 @@ class Trainer:
                     "Model forward must return at least two outputs: "
                     "(pre_ictal_pred, countdown_pred)"
                 )
+            if len(outputs) >= 3:
+                next_hidden_state = outputs[2]
+            if return_hidden_state:
+                return outputs[0], outputs[1], next_hidden_state
             return outputs[0], outputs[1]
 
         raise ValueError(
             "Model forward returned unsupported output type. Expected tuple/list/dict with "
             "pre-ictal and countdown predictions."
         )
+
+    def _create_stateful_loaders(self, train_dataset, val_dataset):
+        """Create patient-partitioned stateful loaders for training/validation."""
+        if getattr(train_dataset, 'subject_ids', None) is None:
+            raise ValueError('Stateful training requires subject_ids on train dataset')
+
+        rank_train_dataset = train_dataset
+        if self.distributed:
+            assignments = partition_patients_by_batch_count(
+                train_dataset,
+                batch_size=self.training_config.batch_size,
+                world_size=self.world_size,
+            )
+            my_patients = assignments[self.rank]
+            subject_ids = np.asarray(train_dataset.subject_ids).astype(str)
+            keep_idx = np.where(np.isin(subject_ids, np.asarray(my_patients, dtype=str)))[0]
+            rank_train_dataset = IndexedTemporalDatasetView(train_dataset, keep_idx)
+            if self._is_main_process():
+                logger.info('Stateful DDP patient partitioning enabled across %d ranks', self.world_size)
+
+        train_loader = TemporalPatientSequenceDataLoader(
+            rank_train_dataset,
+            batch_size=self.training_config.batch_size,
+            reset_hidden_between_epochs=bool(getattr(self.training_config, 'reset_hidden_between_epochs', False)),
+            allow_partial_batches=True,
+            shuffle_patients=True,
+        )
+
+        val_loader = None
+        if (not self.distributed) or self._is_main_process():
+            val_loader = TemporalPatientSequenceDataLoader(
+                val_dataset,
+                batch_size=self.training_config.batch_size,
+                reset_hidden_between_epochs=True,
+                allow_partial_batches=True,
+                shuffle_patients=False,
+            )
+
+        if self._is_main_process():
+            logger.info('Stateful train loader: %d patient-sequential batches', len(train_loader))
+            if val_loader is not None:
+                logger.info('Stateful val loader: %d patient-sequential batches', len(val_loader))
+
+        return train_loader, val_loader
 
     def _progress(self, iterable, desc: str, total: Optional[int] = None):
         """Return tqdm iterator on main process, plain iterable otherwise."""
@@ -1051,6 +1126,9 @@ class Trainer:
         Returns:
             Tuple of (train_loader, val_loader)
         """
+        if self._use_stateful_training():
+            return self._create_stateful_loaders(train_dataset, val_dataset)
+
         long_sweep_mode = bool(getattr(self.training_config, 'long_sweep_training', False))
 
         # Distributed sampler for training
@@ -1142,6 +1220,243 @@ class Trainer:
                 logger.warning("WeightedRandomSampler is disabled in distributed mode; using loss class weighting instead.")
         
         return train_loader, val_loader
+
+    def train_epoch_stateful(self, model: nn.Module, train_loader,
+                             criterion: nn.Module, optimizer: optim.Optimizer,
+                             epoch: int) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+        """Train one epoch with hidden-state carry across sequential patient batches."""
+        model.train()
+        hidden_mgr = HiddenStateManager(
+            device=str(self.device),
+            detach_interval=max(1, int(getattr(self.training_config, 'hidden_state_detach_interval', 10))),
+        )
+        if bool(getattr(self.training_config, 'reset_hidden_between_epochs', False)):
+            hidden_mgr.reset()
+
+        metrics_sum = defaultdict(float)
+        num_batches = 0
+        all_pred_preictal = []
+        all_true_preictal = []
+        all_pred_countdown = []
+        all_true_countdown = []
+
+        train_iter = self._progress(train_loader, desc=f"Train Epoch {epoch}", total=len(train_loader))
+        join_ctx = model.join() if self.distributed and hasattr(model, 'join') else nullcontext()
+        last_grad_norm: Optional[float] = None
+        last_batch_size: Optional[int] = None
+        optimizer_steps = 0
+
+        with join_ctx:
+            for batch_idx, (patient_id, batch_features, batch_labels, batch_weights) in enumerate(train_iter):
+                features = torch.from_numpy(batch_features).to(self.device)
+                labels = torch.from_numpy(batch_labels).to(self.device)
+                weights = torch.from_numpy(batch_weights).to(self.device)
+
+                features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+                labels = torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+                weights = torch.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
+
+                features = torch.clamp(features, -200.0, 200.0)
+                labels = torch.clamp(labels, -1.0, float(self.config.model.output_countdown_max))
+                weights = torch.clamp(weights, 0.0, 10.0)
+
+                pre_ictal_labels = (labels >= 0).float()
+                hidden_state = hidden_mgr.get_hidden_state()
+                current_batch_size = int(features.shape[0])
+                if last_batch_size is not None and last_batch_size != current_batch_size:
+                    hidden_state = None
+                last_batch_size = current_batch_size
+                pre_ictal_pred, countdown_pred, hidden_state_new = self._forward_model(
+                    model,
+                    features,
+                    hidden_state=hidden_state,
+                    return_hidden_state=True,
+                )
+
+                loss_dict = criterion(pre_ictal_pred, countdown_pred, pre_ictal_labels, labels, weights)
+                optimizer.zero_grad()
+                loss_dict['total'].backward()
+
+                if self.training_config.gradient_clip_norm > 0:
+                    last_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), self.training_config.gradient_clip_norm))
+
+                optimizer.step()
+                optimizer_steps += 1
+
+                if hidden_state_new is not None:
+                    if isinstance(hidden_state_new, tuple):
+                        hidden_state_new = tuple(h.detach() for h in hidden_state_new)
+                    else:
+                        hidden_state_new = hidden_state_new.detach()
+                hidden_mgr.update_for_batch(str(patient_id), hidden_state_new)
+
+                num_batches += 1
+                for key, value in loss_dict.items():
+                    metrics_sum[f'train_{key}'] += float(value.detach().cpu())
+
+                all_pred_preictal.extend(pre_ictal_pred.detach().cpu().numpy())
+                all_true_preictal.extend(pre_ictal_labels.detach().cpu().numpy())
+                all_pred_countdown.extend(countdown_pred.detach().cpu().numpy())
+                all_true_countdown.extend(labels.detach().cpu().numpy())
+
+                if batch_idx % self.training_config.log_interval == 0 and self._is_main_process():
+                    avg_loss = metrics_sum['train_total'] / max(num_batches, 1)
+                    if last_grad_norm is not None:
+                        logger.info(
+                            f"Epoch {epoch} [{batch_idx}/{len(train_loader)}] Loss: {avg_loss:.4f} "
+                            f"| grad_norm: {last_grad_norm:.4e}"
+                        )
+                    if HAS_TQDM and hasattr(train_iter, 'set_postfix'):
+                        train_iter.set_postfix({
+                            'loss': f'{avg_loss:.4f}',
+                            'lr': f"{optimizer.param_groups[0]['lr']:.2e}",
+                            'steps': optimizer_steps,
+                        })
+
+        stat_tensor = torch.tensor([
+            metrics_sum.get('train_total', 0.0),
+            metrics_sum.get('train_classification', 0.0),
+            metrics_sum.get('train_regression', 0.0),
+            metrics_sum.get('train_ranking', 0.0),
+            float(num_batches),
+        ], device=self.device, dtype=torch.float64)
+        if self.distributed:
+            dist.all_reduce(stat_tensor, op=dist.ReduceOp.SUM)
+
+        global_batches = max(int(stat_tensor[4].item()), 1)
+        metrics = {
+            'train_total': float(stat_tensor[0].item() / global_batches),
+            'train_classification': float(stat_tensor[1].item() / global_batches),
+            'train_regression': float(stat_tensor[2].item() / global_batches),
+            'train_ranking': float(stat_tensor[3].item() / global_batches),
+        }
+
+        train_viz_payload = {
+            'pred_preictal': np.array(all_pred_preictal, dtype=np.float32),
+            'true_preictal': np.array(all_true_preictal, dtype=np.float32),
+        }
+        return metrics, train_viz_payload
+
+    def validate_stateful(self, model: nn.Module, val_loader,
+                          criterion: nn.Module) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+        """Validate with continuous hidden-state carry per patient on rank 0."""
+        if val_loader is None:
+            return ({'val_total': 0.0, 'val_classification': 0.0, 'val_regression': 0.0, 'val_ranking': 0.0, 'val_mae': 0.0, 'val_medae': 0.0, 'val_rmse': 0.0}, {})
+
+        model.eval()
+        hidden_mgr = HiddenStateManager(device=str(self.device), detach_interval=0)
+        metrics = defaultdict(float)
+        num_batches = 0
+        all_pred_countdown = []
+        all_true_countdown = []
+        all_pred_preictal = []
+        all_true_preictal = []
+        all_ecg_proxy = []
+        all_ppg_proxy = []
+        all_eda_proxy = []
+        all_adxl_proxy = []
+        all_hr_proxy = []
+        all_hrv_proxy = []
+        last_batch_size: Optional[int] = None
+
+        with torch.no_grad():
+            val_iter = self._progress(val_loader, desc='Validation', total=len(val_loader))
+            for patient_id, batch_features, batch_labels, batch_weights in val_iter:
+                features = torch.from_numpy(batch_features).to(self.device)
+                labels = torch.from_numpy(batch_labels).to(self.device)
+                weights = torch.from_numpy(batch_weights).to(self.device)
+
+                features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+                labels = torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+                weights = torch.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
+                features_raw_cpu = features.cpu()
+
+                features = torch.clamp(features, -200.0, 200.0)
+                labels = torch.clamp(labels, -1.0, float(self.config.model.output_countdown_max))
+                weights = torch.clamp(weights, 0.0, 10.0)
+                pre_ictal_labels = (labels >= 0).float()
+
+                hidden_state = hidden_mgr.get_hidden_state()
+                current_batch_size = int(features.shape[0])
+                if last_batch_size is not None and last_batch_size != current_batch_size:
+                    hidden_state = None
+                last_batch_size = current_batch_size
+                pre_ictal_pred, countdown_pred, hidden_state_new = self._forward_model(
+                    model,
+                    features,
+                    hidden_state=hidden_state,
+                    return_hidden_state=True,
+                )
+                if hidden_state_new is not None:
+                    if isinstance(hidden_state_new, tuple):
+                        hidden_state_new = tuple(h.detach() for h in hidden_state_new)
+                    else:
+                        hidden_state_new = hidden_state_new.detach()
+                hidden_mgr.update_for_batch(str(patient_id), hidden_state_new)
+
+                loss_dict = criterion(pre_ictal_pred, countdown_pred, pre_ictal_labels, labels, weights)
+                num_batches += 1
+                for key, value in loss_dict.items():
+                    metrics[f'val_{key}'] += float(value.detach().cpu())
+
+                all_pred_preictal.extend(pre_ictal_pred.detach().cpu().numpy())
+                all_true_preictal.extend(pre_ictal_labels.detach().cpu().numpy())
+                all_pred_countdown.extend(countdown_pred.detach().cpu().numpy())
+                all_true_countdown.extend(labels.cpu().numpy())
+
+                full_features = features_raw_cpu.numpy()
+                signal_sequences = full_features[:, :, 0]
+                mid_idx = signal_sequences.shape[1] // 2
+                all_ecg_proxy.extend(signal_sequences[:, mid_idx])
+                all_ppg_proxy.extend(signal_sequences[:, mid_idx])
+                all_eda_proxy.extend(np.zeros(signal_sequences.shape[0], dtype=np.float32))
+                all_adxl_proxy.extend(np.zeros(signal_sequences.shape[0], dtype=np.float32))
+                hr_batch = signal_sequences.mean(axis=1).astype(np.float32)
+                hrv_batch = signal_sequences.std(axis=1).astype(np.float32)
+                all_hr_proxy.extend(hr_batch)
+                all_hrv_proxy.extend(hrv_batch)
+
+        all_pred_countdown = np.array(all_pred_countdown)
+        all_true_countdown = np.array(all_true_countdown)
+        preictal_mask = all_true_countdown >= 0
+        if np.sum(preictal_mask) > 0:
+            mae = np.mean(np.abs(all_pred_countdown[preictal_mask] - all_true_countdown[preictal_mask]))
+            medae = np.median(np.abs(all_pred_countdown[preictal_mask] - all_true_countdown[preictal_mask]))
+            rmse = np.sqrt(np.mean((all_pred_countdown[preictal_mask] - all_true_countdown[preictal_mask]) ** 2))
+        else:
+            mae = medae = rmse = 0.0
+
+        for key in list(metrics.keys()):
+            metrics[key] /= max(num_batches, 1)
+        metrics['val_mae'] = float(mae)
+        metrics['val_medae'] = float(medae)
+        metrics['val_rmse'] = float(rmse)
+
+        alert_metrics = _compute_binary_metrics(
+            (all_true_countdown >= 0).astype(np.int32),
+            np.array(all_pred_preictal, dtype=np.float32),
+            float(self.config.loss.detection_threshold),
+        )
+        metrics['val_alert_balanced_accuracy'] = alert_metrics['balanced_accuracy']
+        metrics['val_alert_sensitivity'] = alert_metrics['sensitivity']
+        metrics['val_alert_specificity'] = alert_metrics['specificity']
+        metrics['val_alert_precision'] = alert_metrics['precision']
+        metrics['val_alert_f1'] = alert_metrics['f1']
+
+        viz_payload = {
+            'pred_preictal': np.array(all_pred_preictal, dtype=np.float32),
+            'pred_preictal_smooth': _causal_smooth(np.array(all_pred_preictal, dtype=np.float32)),
+            'pred_countdown': np.array(all_pred_countdown, dtype=np.float32),
+            'true_countdown': np.array(all_true_countdown, dtype=np.float32),
+            'true_preictal': np.array(all_true_preictal, dtype=np.float32),
+            'ecg_proxy': np.array(all_ecg_proxy, dtype=np.float32),
+            'ppg_proxy': np.array(all_ppg_proxy, dtype=np.float32),
+            'eda_proxy': np.array(all_eda_proxy, dtype=np.float32),
+            'adxl_proxy': np.array(all_adxl_proxy, dtype=np.float32),
+            'hr_proxy': np.array(all_hr_proxy, dtype=np.float32),
+            'hrv_proxy': np.array(all_hrv_proxy, dtype=np.float32),
+        }
+        return dict(metrics), viz_payload
     
     def create_model_optimizer_scheduler(self) -> Tuple[nn.Module, optim.Optimizer, object]:
         """Create model, optimizer, and learning rate scheduler.
@@ -2555,6 +2870,10 @@ class Trainer:
             logger.info("="*60)
             logger.info("Starting training...")
             logger.info("="*60)
+
+        stateful_mode = self._use_stateful_training()
+        if stateful_mode and self._is_main_process():
+            logger.info("Stateful patient-sequential training mode enabled")
         
         # Create dataloaders
         train_loader, val_loader = self.create_dataloaders(train_dataset, val_dataset)
@@ -2615,13 +2934,29 @@ class Trainer:
                     )
 
             # Train
-            train_metrics, train_viz_payload = self.train_epoch(model, train_loader, criterion, optimizer, epoch)
+            if stateful_mode:
+                train_metrics, train_viz_payload = self.train_epoch_stateful(model, train_loader, criterion, optimizer, epoch)
+            else:
+                train_metrics, train_viz_payload = self.train_epoch(model, train_loader, criterion, optimizer, epoch)
             
             # Validate
-            val_metrics, viz_payload = self.validate(model, val_loader, criterion)
+            if stateful_mode:
+                if self.distributed:
+                    if self.device.type == 'cuda':
+                        dist.barrier(device_ids=[self.local_rank])
+                    else:
+                        dist.barrier()
+                val_metrics, viz_payload = self.validate_stateful(model, val_loader, criterion)
+                if self.distributed:
+                    if self.device.type == 'cuda':
+                        dist.barrier(device_ids=[self.local_rank])
+                    else:
+                        dist.barrier()
+            else:
+                val_metrics, viz_payload = self.validate(model, val_loader, criterion)
             
             # Gather metrics across ranks (distributed training)
-            if self.distributed:
+            if self.distributed and not stateful_mode:
                 self._sync_metrics(train_metrics)
                 self._sync_metrics(val_metrics)
             

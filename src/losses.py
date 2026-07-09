@@ -68,7 +68,8 @@ class SeizureCountdownLoss(nn.Module):
         self.weight_tau = config.weight_tau
         self.use_class_weighting = getattr(config, 'use_class_weighting', False)
         self.classification_positive_weight = getattr(config, 'classification_positive_weight', None)
-        self.max_positive_weight = float(getattr(config, 'max_positive_weight', 200.0))
+        max_positive_weight = getattr(config, 'max_positive_weight', 200.0)
+        self.max_positive_weight = 200.0 if max_positive_weight is None else float(max_positive_weight)
         self.onset_positive_weight_boost = float(getattr(config, 'onset_positive_weight_boost', 1.0))
         self.temporal_focus_tau_min = float(getattr(config, 'temporal_focus_tau_min', 5.0))
         self.classification_temporal_boost = float(getattr(config, 'classification_temporal_boost', 0.0))

@@ -272,17 +272,7 @@ class Evaluator:
             for batch in loader:
                 features = batch[0].to(device).float()
                 labels = batch[1].to(device).float()
-
-                if ModelFactory.is_multimodal(self.config.model.model_type):
-                    ecg_dim = self.config.model.ecg_feature_dim
-                    eeg_dim = self.config.model.eeg_feature_dim
-                    motion_dim = self.config.model.motion_feature_dim
-                    ecg_x = features[:, :, :ecg_dim]
-                    eeg_x = features[:, :, ecg_dim:ecg_dim + eeg_dim]
-                    motion_x = features[:, :, ecg_dim + eeg_dim:ecg_dim + eeg_dim + motion_dim]
-                    pre_ictal_pred, countdown_pred = model(ecg_x, eeg_x, motion_x)
-                else:
-                    pre_ictal_pred, countdown_pred = model(features)
+                pre_ictal_pred, countdown_pred = self._forward_model(model, features)
 
                 all_pred_preictal.extend(pre_ictal_pred.detach().cpu().numpy())
                 all_pred_countdown.extend(countdown_pred.detach().cpu().numpy())

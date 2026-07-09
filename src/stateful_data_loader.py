@@ -13,7 +13,8 @@ for stateful LSTM training (vs. random shuffled batches).
 
 import numpy as np
 import logging
-from typing import List, Tuple, Optional, Dict, Iterator
+from math import ceil
+from typing import List, Tuple, Optional, Dict, Iterator, Sequence
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -34,9 +35,11 @@ class TemporalPatientSequenceDataLoader:
             # hidden_state persists to next batch in same patient
     """
     
-    def __init__(self, seizure_dataset, batch_size: int = 32, 
+    def __init__(self, seizure_dataset, batch_size: int = 32,
                  reset_hidden_between_epochs: bool = False,
-                 allow_partial_batches: bool = False):
+                 allow_partial_batches: bool = False,
+                 patient_subset: Optional[Sequence[str]] = None,
+                 shuffle_patients: bool = True):
         """
         Initialize temporal patient sequence loader.
         
@@ -50,6 +53,7 @@ class TemporalPatientSequenceDataLoader:
         self.batch_size = batch_size
         self.reset_hidden_between_epochs = reset_hidden_between_epochs
         self.allow_partial_batches = allow_partial_batches
+        self.shuffle_patients = shuffle_patients
         
         # Extract metadata
         if seizure_dataset.subject_ids is None:
@@ -57,6 +61,7 @@ class TemporalPatientSequenceDataLoader:
         
         self.subject_ids = seizure_dataset.subject_ids
         self.sample_end_times_s = seizure_dataset.sample_end_times_s
+        self.patient_subset = None if patient_subset is None else {str(p) for p in patient_subset}
         
         # Group samples by patient, maintaining temporal order
         self._build_patient_sequences()
@@ -87,6 +92,18 @@ class TemporalPatientSequenceDataLoader:
             sequences.sort(key=lambda x: x[1])
             logger.debug(f"Patient {patient_id}: {len(sequences)} samples, "
                         f"time range {sequences[0][1]:.1f}s - {sequences[-1][1]:.1f}s")
+
+        if self.patient_subset is not None:
+            self.patient_sequences = {
+                patient_id: seq for patient_id, seq in self.patient_sequences.items()
+                if str(patient_id) in self.patient_subset
+            }
+
+        self._num_batches = sum(
+            (len(seq) + self.batch_size - 1) // self.batch_size
+            for seq in self.patient_sequences.values()
+            if self.allow_partial_batches or len(seq) >= self.batch_size
+        )
     
     def __iter__(self) -> Iterator[Tuple[str, np.ndarray, np.ndarray, np.ndarray]]:
         """
@@ -99,7 +116,7 @@ class TemporalPatientSequenceDataLoader:
         """
         # Shuffle patient order (not sample order)
         patient_ids = list(self.patient_sequences.keys())
-        shuffled_patients = np.random.permutation(patient_ids)
+        shuffled_patients = np.random.permutation(patient_ids) if self.shuffle_patients else patient_ids
         
         for patient_id in shuffled_patients:
             # Get temporal sequence for this patient
@@ -132,11 +149,19 @@ class TemporalPatientSequenceDataLoader:
                     batch_weights.append(weight)
                 
                 # Stack into tensors
-                batch_features = np.stack(batch_features, axis=0)  # (batch, time, features)
-                batch_labels = np.array(batch_labels, dtype=np.float32)  # (batch,)
-                batch_weights = np.array(batch_weights, dtype=np.float32)  # (batch,)
+                # Handle both tensor and numpy returns from underlying dataset
+                def _to_numpy(x):
+                    import torch
+                    return x.numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+
+                batch_features = np.stack([_to_numpy(f) for f in batch_features], axis=0)  # (batch, time, features)
+                batch_labels = np.array([_to_numpy(l).item() if hasattr(_to_numpy(l), 'item') else float(l) for l in batch_labels], dtype=np.float32)
+                batch_weights = np.array([_to_numpy(w).item() if hasattr(_to_numpy(w), 'item') else float(w) for w in batch_weights], dtype=np.float32)
                 
                 yield patient_id, batch_features, batch_labels, batch_weights
+
+    def __len__(self) -> int:
+        return int(self._num_batches)
     
     def get_patient_ids(self) -> List[str]:
         """Return list of unique patient IDs."""
@@ -151,6 +176,17 @@ class TemporalPatientSequenceDataLoader:
         total_samples = sum(len(seq) for seq in self.patient_sequences.values())
         patient_lengths = [len(seq) for seq in self.patient_sequences.values()]
         
+        if len(patient_lengths) == 0:
+            return {
+                'num_patients': 0,
+                'total_samples': 0,
+                'batch_size': self.batch_size,
+                'num_batches_per_epoch': 0,
+                'samples_per_patient_mean': 0.0,
+                'samples_per_patient_min': 0,
+                'samples_per_patient_max': 0,
+            }
+        
         return {
             'num_patients': len(self.patient_sequences),
             'total_samples': total_samples,
@@ -159,9 +195,9 @@ class TemporalPatientSequenceDataLoader:
                 (len(seq) + self.batch_size - 1) // self.batch_size
                 for seq in self.patient_sequences.values()
             ),
-            'samples_per_patient_mean': np.mean(patient_lengths),
-            'samples_per_patient_min': np.min(patient_lengths),
-            'samples_per_patient_max': np.max(patient_lengths),
+            'samples_per_patient_mean': float(np.mean(patient_lengths)),
+            'samples_per_patient_min': int(np.min(patient_lengths)),
+            'samples_per_patient_max': int(np.max(patient_lengths)),
         }
 
 
@@ -242,6 +278,81 @@ class HiddenStateManager:
     def get_stats(self) -> Dict:
         """Get statistics about hidden state management."""
         return self.stats.copy()
+
+
+class IndexedTemporalDatasetView:
+    """Metadata-preserving index view over a dataset.
+
+    This wraps SeizureDataset/LazyRealDataset-like objects and restricts them to
+    a chosen list of indices while preserving patient/timeline metadata needed
+    for stateful patient-sequential training.
+    """
+
+    def __init__(self, dataset, indices: Sequence[int]):
+        self._dataset = dataset
+        self._indices = np.asarray(indices, dtype=np.int64)
+
+        for attr in ('subject_ids', 'sample_end_times_s', 'recording_ids', 'labels', 'preictal_labels', 'weights'):
+            if hasattr(dataset, attr):
+                value = getattr(dataset, attr)
+                if value is not None:
+                    try:
+                        setattr(self, attr, np.asarray(value)[self._indices])
+                    except Exception:
+                        setattr(self, attr, value)
+                else:
+                    setattr(self, attr, None)
+
+    def __len__(self):
+        return int(len(self._indices))
+
+    def __getitem__(self, idx: int):
+        return self._dataset[int(self._indices[idx])]
+
+    @property
+    def class_distribution(self) -> Dict[str, int]:
+        if hasattr(self, 'preictal_labels') and self.preictal_labels is not None:
+            lbl = np.asarray(self.preictal_labels, dtype=np.float32)
+            return {
+                'preictal': int(np.sum(lbl > 0.5)),
+                'interictal': int(len(lbl) - np.sum(lbl > 0.5)),
+            }
+        if hasattr(self._dataset, 'class_distribution'):
+            return self._dataset.class_distribution
+        return {'preictal': 0, 'interictal': 0}
+
+
+def partition_patients_by_batch_count(
+    dataset,
+    batch_size: int,
+    world_size: int,
+) -> List[List[str]]:
+    """Greedily assign full patients to ranks while balancing batch counts."""
+    if getattr(dataset, 'subject_ids', None) is None:
+        raise ValueError('Stateful distributed partitioning requires subject_ids')
+
+    subject_ids = np.asarray(dataset.subject_ids).astype(str)
+    patient_ids = np.unique(subject_ids)
+    patient_rows = []
+    for patient_id in patient_ids:
+        n_samples = int(np.sum(subject_ids == patient_id))
+        n_batches = int(ceil(n_samples / max(batch_size, 1)))
+        patient_rows.append((patient_id, n_samples, n_batches))
+
+    patient_rows.sort(key=lambda row: (row[2], row[1]), reverse=True)
+    assignments: List[List[str]] = [[] for _ in range(max(world_size, 1))]
+    loads = [0 for _ in range(max(world_size, 1))]
+
+    for patient_id, _, n_batches in patient_rows:
+        best_rank = min(range(len(assignments)), key=lambda rank: loads[rank])
+        assignments[best_rank].append(str(patient_id))
+        loads[best_rank] += n_batches
+
+    logger.info(
+        'Distributed patient partitioning by batch count: %s',
+        ', '.join([f'rank{rank}={loads[rank]} batches/{len(assignments[rank])} patients' for rank in range(len(assignments))])
+    )
+    return assignments
 
 
 # Example integration into training loop:
