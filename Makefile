@@ -4,7 +4,7 @@ ifneq ($(strip $(CONDA_PREFIX)),)
 PYTHON ?= $(CONDA_PREFIX)/bin/python
 TORCHRUN ?= $(CONDA_PREFIX)/bin/torchrun
 else
-PYTHON ?= python
+PYTHON ?= python3
 TORCHRUN ?= torchrun
 endif
 
@@ -22,6 +22,8 @@ LR ?= 0.001
 CONFIG ?=
 DATA_MODE ?= real
 DATA_SOURCE ?= bids
+WANDB_MODE ?= online
+WANDB_PROJECT ?= epilepsee-ai
 DATASET_ROOT ?=
 MAX_RECORDINGS ?= 120
 MAX_SAMPLES_PER_RECORDING ?= 120
@@ -45,8 +47,11 @@ ONLINE_AUG_PROB ?= 0.7
 STATE_LOSS ?= 0
 ONSET_THRESHOLD_MIN ?= 2.0
 RING_BUFFER_SIZE ?= 0
+OPTIMIZER_STEP_SCOPE ?= batch
+PATIENTS_PER_STEP ?= 1
 
 TRAIN_ARGS = --model-type $(MODEL) --epochs $(EPOCHS) --batch-size $(BATCH) --learning-rate $(LR) --data-mode $(DATA_MODE) --data-source $(DATA_SOURCE) --max-recordings $(MAX_RECORDINGS) --max-samples-per-recording $(MAX_SAMPLES_PER_RECORDING)
+TRAIN_ARGS += --wandb-mode $(WANDB_MODE) --wandb-project $(WANDB_PROJECT)
 ifneq ($(strip $(DATASET_ROOT)),)
 TRAIN_ARGS += --dataset-root $(DATASET_ROOT)
 endif
@@ -71,6 +76,7 @@ endif
 ifneq ($(strip $(RING_BUFFER_SIZE)),0)
 TRAIN_ARGS += --ring-buffer-size $(RING_BUFFER_SIZE)
 endif
+TRAIN_ARGS += --optimizer-step-scope $(OPTIMIZER_STEP_SCOPE) --patients-per-step $(PATIENTS_PER_STEP)
 
 .PHONY: help test test-training train train-ddp train-dummy train-ddp-dummy \
 	train-temporal train-temporal-ddp train-multimodal-ddp \
@@ -107,17 +113,17 @@ help: ## Show all available commands
 	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-24s %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Example:"
-	@echo "  make train-ddp MODEL=temporal_transformer EPOCHS=100 DATASET_ROOT=/path/to/ds005873"
-	@echo "  make train-eegnet-ddp EPOCHS=25 DATASET_ROOT=/path/to/ds005873"
+	@echo "  make train-ddp MODEL=temporal_transformer EPOCHS=100 DATASET_ROOT=/path/to/SeizeIT2"
+	@echo "  make train-eegnet-ddp EPOCHS=25 DATASET_ROOT=/path/to/SeizeIT2"
 	@echo "  make train-eegnet GPU=0  # force single-GPU"
-	@echo "  make train-watch-eegnet DATASET_ROOT=/path/to/ds005873"
-	@echo "  make train-ecg-progression DATASET_ROOT=/path/to/ds005873"
+	@echo "  make train-watch-eegnet DATASET_ROOT=/path/to/SeizeIT2"
+	@echo "  make train-ecg-progression DATASET_ROOT=/path/to/SeizeIT2"
 	@echo "  make quantize MODEL=eegnet Q_MODE=dynamic_int8"
 	@echo "  make quantize MODEL=eegnet Q_CHECKPOINT=models/best_model.pt Q_CONFIG=models/config.yaml"
-	@echo "  make train-snapshot-eegnet DATASET_ROOT=/path/to/ds005873"
+	@echo "  make train-snapshot-eegnet DATASET_ROOT=/path/to/SeizeIT2"
 	@echo "  make quantize-eegnet-artifact"
-	@echo "  make train-reliable-ecg-ddp DATASET_ROOT=/path/to/ds005873"
-	@echo "  make train-auto-threshold MODEL=tcn DATASET_ROOT=/path/to/ds005873"
+	@echo "  make train-reliable-ecg-ddp DATASET_ROOT=/path/to/SeizeIT2"
+	@echo "  make train-auto-threshold MODEL=tcn DATASET_ROOT=/path/to/SeizeIT2"
 	@echo "  make train-wearable-recommended"
 	@echo "  make quantize-watch"
 
@@ -129,7 +135,7 @@ env-check: ## Print Python/Torch environment diagnostics
 dataset-check: ## Verify DATASET_ROOT exists and looks like a BIDS dataset
 	@if [ -z "$(DATASET_ROOT)" ]; then \
 		echo "ERROR: DATASET_ROOT is empty."; \
-		echo "Usage: make dataset-check DATASET_ROOT=/path/to/ds005873"; \
+		echo "Usage: make dataset-check DATASET_ROOT=/path/to/SeizeIT2"; \
 		exit 2; \
 	fi
 	@if [ ! -d "$(DATASET_ROOT)" ]; then \
@@ -415,6 +421,13 @@ train-auto-threshold-ddp: ## Train DDP and auto-select detection threshold
 		--threshold-max-fpr $(THRESH_MAX_FPR) \
 		--write-threshold-to-config \
 		--seed $(SEED)
+
+train-overnight: ## Reliable overnight DDP training with W&B online
+	@if [ -z "$(DATASET_ROOT)" ]; then \
+		echo "DATASET_ROOT is required. Example: make train-overnight MODEL=tcn DATASET_ROOT=/mnt/d/Datasets/SeizeIT2 EPOCHS=7"; \
+		exit 1; \
+	fi
+	PYTHON=$(PYTHON) TORCHRUN=$(TORCHRUN) $(SHELL) scripts/run_reliable_training.sh --ddp --gpu $(GPU) --nproc $(NPROC) --dataset-root $(DATASET_ROOT) --wandb-mode online --wandb-project $(WANDB_PROJECT) --run-name overnight_$(MODEL) --epochs $(EPOCHS) --batch-size $(BATCH) --data-source $(DATA_SOURCE) -- --model-type $(MODEL)
 
 train-auto-threshold-sampling-sweep: ## Single-GPU sweep over REAL_STRIDE_SECONDS values
 	@set -e; \

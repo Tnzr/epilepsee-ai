@@ -9,12 +9,14 @@ Supports:
 Outputs:
 - Quantized checkpoint (.pt)
 - Optional TorchScript export (.ts)
+- Optional ONNX export (.onnx)
 - JSON report with size + latency comparison
 
 Examples:
     python scripts/quantize.py --model-type eegnet
-    python scripts/quantize.py --model-type temporal_transformer --mode dynamic_int8
+    python scripts/quantize.py --model-type temporal_transformer --mode float16
     python scripts/quantize.py --config models/config.yaml --checkpoint models/best_model.pt
+    python scripts/quantize.py --model-type tcn --no-torchscript
 """
 
 import os
@@ -64,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations for latency")
     parser.add_argument("--iters", type=int, default=100, help="Benchmark iterations")
     parser.add_argument("--no-torchscript", action="store_true", help="Skip TorchScript export")
+    parser.add_argument("--no-onnx", action="store_false", dest="export_onnx", help="Skip ONNX export")
+    parser.add_argument("--onnx-opset", type=int, default=17, help="ONNX opset version")
     return parser.parse_args()
 
 
@@ -172,6 +176,40 @@ def _export_torchscript(model: nn.Module, example_inputs, output_path: Path) -> 
         return f"failed: {exc}"
 
 
+def _export_onnx(model: nn.Module, example_inputs, output_path: Path, opset: int = 17) -> str:
+    try:
+        model.eval()
+        with torch.no_grad():
+            if isinstance(example_inputs, tuple):
+                input_names = [f"input_{i}" for i in range(len(example_inputs))]
+                dynamic_axes = {
+                    name: {0: "batch_size", 1: "sequence_length"}
+                    for name in input_names
+                }
+                dynamic_axes["output"] = {0: "batch_size", 1: "sequence_length"}
+            else:
+                input_names = ["input"]
+                dynamic_axes = {
+                    "input": {0: "batch_size", 1: "sequence_length"},
+                    "output": {0: "batch_size", 1: "sequence_length"},
+                }
+            torch.onnx.export(
+                model,
+                example_inputs,
+                str(output_path),
+                export_params=True,
+                opset_version=opset,
+                do_constant_folding=True,
+                input_names=input_names,
+                output_names=["output"],
+                dynamic_axes=dynamic_axes,
+                training=torch.onnx.TrainingMode.EVAL,
+            )
+        return "ok"
+    except Exception as exc:  # noqa: BLE001
+        return f"failed: {exc}"
+
+
 def main() -> int:
     args = parse_args()
 
@@ -224,6 +262,14 @@ def main() -> int:
     if not args.no_torchscript:
         torchscript_status = _export_torchscript(qmodel, example_inputs_q, torchscript_path)
 
+    onnx_status = "skipped"
+    onnx_path = output_dir / f"{stem}.onnx"
+    if args.export_onnx:
+        onnx_inputs = example_inputs_q if args.mode != "dynamic_int8" else example_inputs
+        if args.mode == "dynamic_int8":
+            print("NOTE: dynamic int8 ONNX export is unstable; exporting baseline float model for ONNX instead.")
+        onnx_status = _export_onnx(qmodel if args.mode != "dynamic_int8" else baseline_model, onnx_inputs, onnx_path, args.onnx_opset)
+
     report: Dict[str, object] = {
         "model_type": model_type,
         "mode": args.mode,
@@ -231,6 +277,8 @@ def main() -> int:
         "quant_checkpoint": str(quant_ckpt_path),
         "torchscript": str(torchscript_path),
         "torchscript_status": torchscript_status,
+        "onnx": str(onnx_path),
+        "onnx_status": onnx_status,
         "baseline_size_mb": baseline_size_mb,
         "quantized_size_mb": quant_size_mb,
         "size_reduction_pct": (1.0 - quant_size_mb / max(1e-12, baseline_size_mb)) * 100.0,
@@ -256,6 +304,7 @@ def main() -> int:
     print(f"Speedup:        {report['latency_speedup_x']:.3f}x")
     print(f"Saved checkpoint: {quant_ckpt_path}")
     print(f"TorchScript:      {torchscript_status}")
+    print(f"ONNX export:      {onnx_status}")
     print(f"Report:           {report_path}")
     print("=" * 64)
 

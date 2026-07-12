@@ -10,9 +10,12 @@ Features:
 """
 
 import os
+import sys
 import json
 import re
+import math
 import logging
+import signal
 import importlib
 from contextlib import nullcontext
 import torch
@@ -510,14 +513,17 @@ def _extract_hr_hrv_from_sequences(ecg_sequences: np.ndarray, sampling_rate_hz: 
     return hr_values, hrv_values
 
 
-def _parse_recording_uid(recording_uid: str) -> Optional[Tuple[str, str, str]]:
+def _parse_recording_uid(recording_uid: str) -> Optional[Tuple[str, str, int]]:
     """Parse canonical recording IDs like sub-001_ses-01_run-3."""
     if not recording_uid:
         return None
     m = re.match(r"sub-([^_]+)_ses-([^_]+)_run-([^_]+)", str(recording_uid))
     if m is None:
         return None
-    return m.group(1), m.group(2), m.group(3)
+    try:
+        return m.group(1), m.group(2), int(m.group(3))
+    except ValueError:
+        return None
 
 
 def _interp_to_grid(source_t: np.ndarray, source_v: np.ndarray, target_t: np.ndarray) -> np.ndarray:
@@ -555,18 +561,27 @@ def _extract_hr_hrv_from_dense_ecg(ecg_signal: np.ndarray, sampling_rate_hz: flo
         z = np.zeros(n, dtype=np.float32)
         return z, z
 
-    threshold = 0.5 * std
-    candidates = np.where(
-        (centered[1:-1] > centered[:-2])
-        & (centered[1:-1] >= centered[2:])
-        & (centered[1:-1] > threshold)
-    )[0] + 1
+    peaks: List[int]
+    try:
+        from scipy.signal import find_peaks  # type: ignore
 
-    min_dist = max(1, int(0.3 * sampling_rate_hz))
-    peaks: List[int] = []
-    for pk in candidates.tolist():
-        if not peaks or (pk - peaks[-1]) >= min_dist:
-            peaks.append(int(pk))
+        prominence = max(std * 0.35, 1e-7)
+        min_dist = max(1, int(0.25 * sampling_rate_hz))
+        peak_idx, _ = find_peaks(centered, distance=min_dist, prominence=prominence)
+        peaks = peak_idx.astype(np.int64).tolist()
+    except Exception:
+        threshold = 0.5 * std
+        candidates = np.where(
+            (centered[1:-1] > centered[:-2])
+            & (centered[1:-1] >= centered[2:])
+            & (centered[1:-1] > threshold)
+        )[0] + 1
+
+        min_dist = max(1, int(0.3 * sampling_rate_hz))
+        peaks = []
+        for pk in candidates.tolist():
+            if not peaks or (pk - peaks[-1]) >= min_dist:
+                peaks.append(int(pk))
 
     if len(peaks) < 2:
         z = np.zeros(n, dtype=np.float32)
@@ -586,6 +601,100 @@ def _extract_hr_hrv_from_dense_ecg(ecg_signal: np.ndarray, sampling_rate_hz: flo
     hr = _interp_to_grid(peak_times, inst_hr, full_times)
     hrv = _interp_to_grid(peak_times, inst_hrv, full_times)
     return hr.astype(np.float32), hrv.astype(np.float32)
+
+
+def _choose_panel_recording_uid(
+    panel_recording_ids: np.ndarray,
+    all_recording_ids: Optional[np.ndarray],
+    panel_loader=None,
+) -> Optional[str]:
+    """Prefer recordings with richer modalities for dense visualization rebuilds."""
+    rec_ids = np.asarray(panel_recording_ids)
+    if rec_ids.size == 0:
+        return None
+
+    unique_recs, rec_counts = np.unique(rec_ids, return_counts=True)
+    chosen_rec = str(unique_recs[int(np.argmax(rec_counts))])
+    if panel_loader is None:
+        return chosen_rec
+
+    modality_rank: List[Tuple[int, int, str]] = []
+
+    def _modality_score_for_recording(sub_id: str, ses_id: str, run_id: int) -> int:
+        # Prefer EEG availability first, then EMG/MOV as secondary richness.
+        # This keeps the dedicated EEG subplot alive whenever possible.
+        score = 0
+        try:
+            panel_loader.resolve_subject_edf_path(sub_id, session_id=ses_id, datatype='eeg', run_id=run_id)
+            score += 3
+        except Exception:
+            pass
+        for datatype in ('emg', 'mov'):
+            try:
+                panel_loader.resolve_subject_edf_path(sub_id, session_id=ses_id, datatype=datatype, run_id=run_id)
+                score += 1
+            except Exception:
+                continue
+        return score
+
+    for rec_id, freq in zip(unique_recs, rec_counts):
+        rec_name = str(rec_id)
+        parsed = _parse_recording_uid(rec_name)
+        if parsed is None:
+            modality_rank.append((-1, int(freq), rec_name))
+            continue
+
+        sub_id, ses_id, run_id = parsed
+        score = _modality_score_for_recording(sub_id, ses_id, run_id)
+        modality_rank.append((score, int(freq), rec_name))
+
+    if modality_rank:
+        modality_rank.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        chosen_score, _, chosen_name = modality_rank[0]
+        chosen_rec = str(chosen_name)
+
+        if chosen_score <= 0 and all_recording_ids is not None:
+            global_recs, global_counts = np.unique(np.asarray(all_recording_ids), return_counts=True)
+            global_rank: List[Tuple[int, int, str]] = []
+            for rec_id, rec_n in zip(global_recs, global_counts):
+                rec_name = str(rec_id)
+                parsed = _parse_recording_uid(rec_name)
+                if parsed is None or int(rec_n) < 2:
+                    continue
+
+                sub_id, ses_id, run_id = parsed
+                score = _modality_score_for_recording(sub_id, ses_id, run_id)
+                global_rank.append((score, int(rec_n), rec_name))
+
+            if global_rank:
+                global_rank.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                best_score, _, best_rec = global_rank[0]
+                if best_score > chosen_score:
+                    chosen_rec = str(best_rec)
+
+    return chosen_rec
+
+
+def _compute_local_balanced_accuracy(
+    true_binary: np.ndarray,
+    pred_binary: np.ndarray,
+    window: int,
+) -> np.ndarray:
+    """Compute a rolling local balanced accuracy trace for panel diagnostics."""
+    truth = np.asarray(true_binary, dtype=np.int32)
+    pred = np.asarray(pred_binary, dtype=np.int32)
+    out = np.zeros_like(truth, dtype=np.float32)
+    for idx in range(truth.size):
+        left = max(0, idx - window + 1)
+        win_truth = truth[left:idx + 1]
+        win_pred = pred[left:idx + 1]
+        pos_mask = win_truth == 1
+        neg_mask = win_truth == 0
+
+        sensitivity = float(np.mean((win_pred[pos_mask] == 1).astype(np.float32))) if np.any(pos_mask) else 1.0
+        specificity = float(np.mean((win_pred[neg_mask] == 0).astype(np.float32))) if np.any(neg_mask) else 1.0
+        out[idx] = 0.5 * (sensitivity + specificity)
+    return out
 
 
 def _safe_float(x: float, default: float = 0.0) -> float:
@@ -608,6 +717,7 @@ def _compute_panel_anomaly_report(
     emg_signal: Optional[np.ndarray] = None,
     mov_signal: Optional[np.ndarray] = None,
     token_roll: Optional[np.ndarray] = None,
+    context_energy: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
     """Compute automated panel anomaly checks from epoch visualization inputs."""
     ecg = np.asarray(ecg_signal, dtype=np.float32)
@@ -673,6 +783,11 @@ def _compute_panel_anomaly_report(
         "dominant_channel_ratio": 0.0,
         "normalized_entropy": 0.0,
         "mean_channel_std": 0.0,
+        "mean_token_strength": 0.0,
+        "mean_token_certainty": 0.0,
+        "mean_token_transition_density": 0.0,
+        "context_energy_mean": 0.0,
+        "context_energy_std": 0.0,
     }
     if token_roll is not None:
         tok = np.asarray(token_roll, dtype=np.float32)
@@ -688,6 +803,28 @@ def _compute_panel_anomaly_report(
             token_stats["dominant_channel_ratio"] = _safe_float(dom)
             entropy = -np.sum([p * np.log(p + 1e-12) for p in probs if p > 0.0])
             token_stats["normalized_entropy"] = _safe_float(entropy / np.log(max(2, n_ch)))
+            clipped = np.clip(tok, 0.0, None)
+            row_sum = np.maximum(np.sum(clipped, axis=1, keepdims=True), 1e-6)
+            norm = clipped / row_sum
+            entropy_ts = -np.sum(norm * np.log(norm + 1e-12), axis=1)
+            entropy_ts = entropy_ts / np.log(max(2, n_ch))
+            certainty_ts = np.clip(1.0 - entropy_ts, 0.0, 1.0)
+            token_stats["mean_token_strength"] = _safe_float(np.mean(np.max(clipped, axis=1)))
+            token_stats["mean_token_certainty"] = _safe_float(np.mean(certainty_ts))
+            dominant_index = np.argmax(clipped, axis=1)
+            switch_events = np.zeros(dominant_index.shape[0], dtype=np.float32)
+            if dominant_index.shape[0] > 1:
+                switch_events[1:] = (dominant_index[1:] != dominant_index[:-1]).astype(np.float32)
+            window = max(3, min(25, dominant_index.shape[0] // 20 if dominant_index.shape[0] >= 20 else 3))
+            kernel = np.ones(window, dtype=np.float32) / float(window)
+            token_stats["mean_token_transition_density"] = _safe_float(np.mean(np.convolve(switch_events, kernel, mode='same')))
+
+    if context_energy is not None:
+        ctx = np.asarray(context_energy, dtype=np.float32)
+        ctx_f = np.isfinite(ctx)
+        if np.any(ctx_f):
+            token_stats["context_energy_mean"] = _safe_float(np.mean(ctx[ctx_f]))
+            token_stats["context_energy_std"] = _safe_float(np.std(ctx[ctx_f]))
 
     ds = str(data_source).lower()
     expected_eeg = ds == 'bids'
@@ -912,9 +1049,11 @@ class Trainer:
         
         # Initialize wandb (only on main process)
         self.wandb_run = None
+        self._shutdown_requested = False
         if self.use_wandb and self._is_main_process():
             self._init_wandb()
 
+        self._register_signal_handlers()
         self.epoch_visualizer = None
         if self._is_main_process():
             self.epoch_visualizer = SignalVisualizer(
@@ -926,12 +1065,20 @@ class Trainer:
     
     def _setup_distributed(self):
         """Initialize distributed training environment."""
+        os.environ.setdefault('NCCL_TIMEOUT', '1800')
+        os.environ.setdefault('TORCH_NCCL_TIMEOUT', '1800')
+        os.environ.setdefault('NCCL_DEBUG', 'WARN')
+
         if not dist.is_initialized():
+            from datetime import timedelta
             dist.init_process_group(
                 backend=self.training_config.backend,
                 init_method='env://',
                 world_size=int(os.environ.get('WORLD_SIZE', 1)),
-                rank=int(os.environ.get('RANK', 0))
+                rank=int(os.environ.get('RANK', 0)),
+                # Stateful validation on rank 0 can take >10 minutes while
+                # other ranks wait at synchronization barriers.
+                timeout=timedelta(minutes=90),
             )
         
         self.rank = dist.get_rank()
@@ -948,7 +1095,86 @@ class Trainer:
     def _is_main_process(self) -> bool:
         """Check if current process is main process."""
         return self.rank == 0
-    
+
+    def _register_signal_handlers(self) -> None:
+        """Register termination handlers to flush wandb cleanly."""
+        if not hasattr(signal, 'SIGTERM'):
+            return
+
+        def _handle_signal(signum, frame):
+            logger.warning("Received termination signal %s. Attempting clean shutdown.", signum)
+            if self.wandb_run is not None and HAS_WANDB:
+                try:
+                    wandb.finish()
+                except Exception as finish_exc:
+                    logger.warning("Failed to finish wandb on signal: %s", finish_exc)
+            sys.exit(128 + signum)
+
+        try:
+            signal.signal(signal.SIGTERM, _handle_signal)
+            signal.signal(signal.SIGINT, _handle_signal)
+        except Exception as exc:
+            logger.warning("Could not register signal handlers: %s", exc)
+
+    def _distributed_train_loader_lengths_match(self, train_loader) -> bool:
+        """Return True if all distributed ranks have the same train loader length."""
+        if not self.distributed:
+            return True
+        local_len = torch.tensor([len(train_loader)], dtype=torch.int64, device=self.device)
+        max_len = local_len.clone()
+        min_len = local_len.clone()
+        dist.all_reduce(max_len, op=dist.ReduceOp.MAX)
+        dist.all_reduce(min_len, op=dist.ReduceOp.MIN)
+        return int(max_len.item()) == int(min_len.item())
+
+    def _get_visualization_indices(self, total_batches: int) -> List[Tuple[int, int]]:
+        """Return quarter-epoch batch indices and quarter numbers for visualization."""
+        quarters = int(getattr(self.training_config, 'visualization_quarters', 0))
+        if quarters <= 1 or total_batches <= 0:
+            return []
+
+        indices: List[Tuple[int, int]] = []
+        for q in range(1, quarters):
+            idx = int(math.ceil(float(total_batches) * float(q) / float(quarters))) - 1
+            idx = min(max(0, idx), total_batches - 1)
+            if not any(existing_idx == idx for existing_idx, _ in indices):
+                indices.append((idx, q))
+        return indices
+
+    def _run_visualization_checkpoint(
+        self,
+        model: nn.Module,
+        val_loader,
+        criterion: nn.Module,
+        epoch: int,
+        train_viz_payload: Optional[Dict[str, np.ndarray]] = None,
+        suffix: Optional[str] = None,
+        max_val_batches: Optional[int] = None,
+    ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+        """Run validation and save the epoch visualization, optionally with a suffix."""
+        # Validation sets model.eval(); preserve original mode so mid-epoch
+        # checkpoints do not leave the training loop in eval mode.
+        was_training = bool(model.training)
+        module_was_training = bool(model.module.training) if isinstance(model, DDP) else was_training
+
+        if self._use_stateful_training():
+            val_metrics, viz_payload = self.validate_stateful(
+                model,
+                val_loader,
+                criterion,
+                max_batches=max_val_batches,
+            )
+        else:
+            val_metrics, viz_payload = self.validate(model, val_loader, criterion)
+
+        if was_training:
+            model.train()
+        if isinstance(model, DDP) and module_was_training:
+            model.module.train()
+
+        self._save_epoch_visualizations(epoch, viz_payload, train_viz_payload=train_viz_payload, suffix=suffix)
+        return val_metrics, viz_payload
+
     def _init_wandb(self):
         """Initialize Weights & Biases logging."""
         if not HAS_WANDB:
@@ -1025,6 +1251,7 @@ class Trainer:
                 outputs = model(features)
 
         next_hidden_state = None
+        context_state = None
 
         # Support models that may emit auxiliary outputs in addition to
         # (pre_ictal_pred, countdown_pred).
@@ -1045,7 +1272,12 @@ class Trainer:
                     f"Available keys: {sorted(outputs.keys())}"
                 )
             if return_hidden_state:
-                return pre_ictal_pred, countdown_pred, outputs.get('hidden_state')
+                context_state = outputs.get('context_state')
+                if context_state is None:
+                    context_state = getattr(model, 'last_context_state', None)
+                    if context_state is None and hasattr(model, 'module'):
+                        context_state = getattr(model.module, 'last_context_state', None)
+                return pre_ictal_pred, countdown_pred, outputs.get('hidden_state'), context_state
             return pre_ictal_pred, countdown_pred
 
         if isinstance(outputs, (tuple, list)):
@@ -1057,7 +1289,10 @@ class Trainer:
             if len(outputs) >= 3:
                 next_hidden_state = outputs[2]
             if return_hidden_state:
-                return outputs[0], outputs[1], next_hidden_state
+                context_state = getattr(model, 'last_context_state', None)
+                if context_state is None and hasattr(model, 'module'):
+                    context_state = getattr(model.module, 'last_context_state', None)
+                return outputs[0], outputs[1], next_hidden_state, context_state
             return outputs[0], outputs[1]
 
         raise ValueError(
@@ -1221,11 +1456,25 @@ class Trainer:
         
         return train_loader, val_loader
 
-    def train_epoch_stateful(self, model: nn.Module, train_loader,
-                             criterion: nn.Module, optimizer: optim.Optimizer,
-                             epoch: int) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+    def train_epoch_stateful(
+        self,
+        model: nn.Module,
+        train_loader,
+        criterion: nn.Module,
+        optimizer: optim.Optimizer,
+        epoch: int,
+        val_loader=None,
+        visualization_indices: Optional[List[Tuple[int, int]]] = None,
+    ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
         """Train one epoch with hidden-state carry across sequential patient batches."""
         model.train()
+        if isinstance(model, DDP):
+            model.module.train()
+        if not model.training or (isinstance(model, DDP) and not model.module.training):
+            logger.warning("Model training mode was not enabled; forcing train() on DDP wrapper and module.")
+            model.train()
+            if isinstance(model, DDP):
+                model.module.train()
         hidden_mgr = HiddenStateManager(
             device=str(self.device),
             detach_interval=max(1, int(getattr(self.training_config, 'hidden_state_detach_interval', 10))),
@@ -1242,12 +1491,35 @@ class Trainer:
 
         train_iter = self._progress(train_loader, desc=f"Train Epoch {epoch}", total=len(train_loader))
         join_ctx = model.join() if self.distributed and hasattr(model, 'join') else nullcontext()
+        visualization_index_map = {idx: q for idx, q in (visualization_indices or [])}
+        distributed_viz_sync = bool(self.distributed)
+        if self.distributed and visualization_index_map and not self._distributed_train_loader_lengths_match(train_loader):
+            if self._is_main_process():
+                logger.warning(
+                    "Unequal distributed stateful train loader lengths detected; "
+                    "running intermediate quarter-epoch visualizations on rank 0 without cross-rank barriers."
+                )
+            distributed_viz_sync = False
+            if not self._is_main_process():
+                visualization_index_map = {}
         last_grad_norm: Optional[float] = None
         last_batch_size: Optional[int] = None
         optimizer_steps = 0
+        batch_loss_ema: Optional[float] = None
 
         with join_ctx:
             for batch_idx, (patient_id, batch_features, batch_labels, batch_weights) in enumerate(train_iter):
+                if (not model.training) or (isinstance(model, DDP) and not model.module.training):
+                    logger.warning(
+                        "Model switched to eval mode during stateful training loop; restoring train mode "
+                        "(epoch=%d, batch=%d).",
+                        int(epoch),
+                        int(batch_idx),
+                    )
+                    model.train()
+                    if isinstance(model, DDP):
+                        model.module.train()
+
                 features = torch.from_numpy(batch_features).to(self.device)
                 labels = torch.from_numpy(batch_labels).to(self.device)
                 weights = torch.from_numpy(batch_weights).to(self.device)
@@ -1266,7 +1538,7 @@ class Trainer:
                 if last_batch_size is not None and last_batch_size != current_batch_size:
                     hidden_state = None
                 last_batch_size = current_batch_size
-                pre_ictal_pred, countdown_pred, hidden_state_new = self._forward_model(
+                pre_ictal_pred, countdown_pred, hidden_state_new, _context_state = self._forward_model(
                     model,
                     features,
                     hidden_state=hidden_state,
@@ -1301,6 +1573,7 @@ class Trainer:
 
                 if batch_idx % self.training_config.log_interval == 0 and self._is_main_process():
                     avg_loss = metrics_sum['train_total'] / max(num_batches, 1)
+                    batch_loss_ema = avg_loss if batch_loss_ema is None else (0.98 * batch_loss_ema + 0.02 * avg_loss)
                     if last_grad_norm is not None:
                         logger.info(
                             f"Epoch {epoch} [{batch_idx}/{len(train_loader)}] Loss: {avg_loss:.4f} "
@@ -1312,6 +1585,57 @@ class Trainer:
                             'lr': f"{optimizer.param_groups[0]['lr']:.2e}",
                             'steps': optimizer_steps,
                         })
+
+                    if self.wandb_run:
+                        log_payload = {
+                            'epoch': epoch,
+                            'batch': batch_idx,
+                            'train/batch_loss': avg_loss,
+                            'train/batch_loss_ema': batch_loss_ema,
+                            'train/learning_rate': optimizer.param_groups[0]['lr'],
+                            'train/optimizer_steps': optimizer_steps,
+                        }
+                        if last_grad_norm is not None:
+                            log_payload['train/grad_norm'] = last_grad_norm
+                        wandb.log(log_payload)
+
+                if batch_idx in visualization_index_map:
+                    if distributed_viz_sync:
+                        dist.barrier()
+
+                    if self._is_main_process():
+                        quarter = visualization_index_map[batch_idx]
+                        suffix = f"q{quarter}"
+                        logger.info(
+                            "Starting intermediate visualization checkpoint %s at epoch %d batch %d/%d",
+                            suffix,
+                            int(epoch),
+                            int(batch_idx),
+                            int(len(train_loader)),
+                        )
+                        self._run_visualization_checkpoint(
+                            model,
+                            val_loader,
+                            criterion,
+                            epoch,
+                            train_viz_payload={
+                                'pred_preictal': np.array(all_pred_preictal, dtype=np.float32),
+                                'true_preictal': np.array(all_true_preictal, dtype=np.float32),
+                            },
+                            suffix=suffix,
+                        )
+                        logger.info(
+                            "Completed intermediate visualization checkpoint %s at epoch %d",
+                            suffix,
+                            int(epoch),
+                        )
+
+                    if distributed_viz_sync:
+                        try:
+                            from datetime import timedelta
+                            dist.barrier(timeout=timedelta(minutes=45))
+                        except TypeError:
+                            dist.barrier()
 
         stat_tensor = torch.tensor([
             metrics_sum.get('train_total', 0.0),
@@ -1337,13 +1661,25 @@ class Trainer:
         }
         return metrics, train_viz_payload
 
-    def validate_stateful(self, model: nn.Module, val_loader,
-                          criterion: nn.Module) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+    def validate_stateful(
+        self,
+        model: nn.Module,
+        val_loader,
+        criterion: nn.Module,
+        max_batches: Optional[int] = None,
+    ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
         """Validate with continuous hidden-state carry per patient on rank 0."""
         if val_loader is None:
             return ({'val_total': 0.0, 'val_classification': 0.0, 'val_regression': 0.0, 'val_ranking': 0.0, 'val_mae': 0.0, 'val_medae': 0.0, 'val_rmse': 0.0}, {})
 
+        if self.distributed and not self._is_main_process():
+            return ({'val_total': 0.0, 'val_classification': 0.0, 'val_regression': 0.0, 'val_ranking': 0.0, 'val_mae': 0.0, 'val_medae': 0.0, 'val_rmse': 0.0}, {})
+
         model.eval()
+        # In distributed stateful mode, only rank 0 runs validation. Bypass the
+        # DDP wrapper so this rank does not participate in DDP collectives while
+        # non-main ranks wait at synchronization barriers.
+        eval_model = model.module if isinstance(model, DDP) else model
         hidden_mgr = HiddenStateManager(device=str(self.device), detach_interval=0)
         metrics = defaultdict(float)
         num_batches = 0
@@ -1352,11 +1688,13 @@ class Trainer:
         all_pred_preictal = []
         all_true_preictal = []
         all_ecg_proxy = []
+        all_eeg_proxy = []
         all_ppg_proxy = []
         all_eda_proxy = []
         all_adxl_proxy = []
         all_hr_proxy = []
         all_hrv_proxy = []
+        all_context_energy = []
         last_batch_size: Optional[int] = None
 
         with torch.no_grad():
@@ -1381,8 +1719,8 @@ class Trainer:
                 if last_batch_size is not None and last_batch_size != current_batch_size:
                     hidden_state = None
                 last_batch_size = current_batch_size
-                pre_ictal_pred, countdown_pred, hidden_state_new = self._forward_model(
-                    model,
+                pre_ictal_pred, countdown_pred, hidden_state_new, context_state = self._forward_model(
+                    eval_model,
                     features,
                     hidden_state=hidden_state,
                     return_hidden_state=True,
@@ -1398,6 +1736,8 @@ class Trainer:
                 num_batches += 1
                 for key, value in loss_dict.items():
                     metrics[f'val_{key}'] += float(value.detach().cpu())
+                if max_batches is not None and num_batches >= max_batches:
+                    break
 
                 all_pred_preictal.extend(pre_ictal_pred.detach().cpu().numpy())
                 all_true_preictal.extend(pre_ictal_labels.detach().cpu().numpy())
@@ -1405,16 +1745,59 @@ class Trainer:
                 all_true_countdown.extend(labels.cpu().numpy())
 
                 full_features = features_raw_cpu.numpy()
-                signal_sequences = full_features[:, :, 0]
-                mid_idx = signal_sequences.shape[1] // 2
-                all_ecg_proxy.extend(signal_sequences[:, mid_idx])
-                all_ppg_proxy.extend(signal_sequences[:, mid_idx])
-                all_eda_proxy.extend(np.zeros(signal_sequences.shape[0], dtype=np.float32))
-                all_adxl_proxy.extend(np.zeros(signal_sequences.shape[0], dtype=np.float32))
+                n_feat = full_features.shape[-1]
+                source = getattr(self.config.data, "data_source", "bids")
+                is_multimodal = ModelFactory.is_multimodal(self.config.model.model_type)
+                ecg_dim = int(self.config.model.ecg_feature_dim)
+                eeg_dim = int(self.config.model.eeg_feature_dim) if is_multimodal else 0
+
+                if is_multimodal and n_feat >= ecg_dim + eeg_dim and ecg_dim > 0 and eeg_dim > 0:
+                    ecg_block = full_features[:, :, :ecg_dim]
+                    eeg_block = full_features[:, :, ecg_dim:ecg_dim + eeg_dim]
+
+                    ecg_std = ecg_block.reshape(-1, ecg_block.shape[-1]).std(axis=0)
+                    eeg_std = eeg_block.reshape(-1, eeg_block.shape[-1]).std(axis=0)
+
+                    ecg_best_ch = int(np.argmax(ecg_std)) if ecg_block.shape[-1] > 0 else 0
+                    eeg_best_ch = int(np.argmax(eeg_std)) if eeg_block.shape[-1] > 0 else 0
+
+                    ecg_sequences = ecg_block[:, :, ecg_best_ch]
+                    eeg_sequences = eeg_block[:, :, eeg_best_ch]
+                    mid_idx = ecg_sequences.shape[1] // 2
+
+                    all_ecg_proxy.extend(ecg_sequences[:, mid_idx])
+                    all_eeg_proxy.extend(eeg_sequences[:, mid_idx])
+
+                    if source == "wearable":
+                        ppg_sequences = ecg_block[:, :, 0] if ecg_block.shape[-1] > 0 else ecg_sequences
+                        adxl_sequences = ecg_block[:, :, 1] if ecg_block.shape[-1] > 1 else np.zeros_like(ppg_sequences)
+                        eda_sequences = eeg_block[:, :, 0] if eeg_block.shape[-1] > 0 else np.zeros_like(ppg_sequences)
+                        all_adxl_proxy.extend(adxl_sequences[:, mid_idx])
+                    else:
+                        ppg_sequences = ecg_sequences
+                        eda_sequences = np.zeros_like(ecg_sequences)
+
+                    all_ppg_proxy.extend(ppg_sequences[:, mid_idx])
+                    all_eda_proxy.extend(eda_sequences[:, mid_idx])
+                    signal_sequences = ecg_sequences
+                else:
+                    signal_sequences = full_features[:, :, 0]
+                    mid_idx = signal_sequences.shape[1] // 2
+                    all_ecg_proxy.extend(signal_sequences[:, mid_idx])
+                    all_ppg_proxy.extend(signal_sequences[:, mid_idx])
+                    all_eda_proxy.extend(np.zeros(signal_sequences.shape[0], dtype=np.float32))
+                    all_adxl_proxy.extend(np.zeros(signal_sequences.shape[0], dtype=np.float32))
+
                 hr_batch = signal_sequences.mean(axis=1).astype(np.float32)
                 hrv_batch = signal_sequences.std(axis=1).astype(np.float32)
                 all_hr_proxy.extend(hr_batch)
                 all_hrv_proxy.extend(hrv_batch)
+                if context_state is not None:
+                    ctx = context_state.detach().cpu().numpy()
+                    if ctx.ndim == 2:
+                        all_context_energy.extend(np.linalg.norm(ctx, axis=1).astype(np.float32))
+                    else:
+                        all_context_energy.extend(np.asarray(ctx, dtype=np.float32).reshape(-1).tolist())
 
         all_pred_countdown = np.array(all_pred_countdown)
         all_true_countdown = np.array(all_true_countdown)
@@ -1456,6 +1839,30 @@ class Trainer:
             'hr_proxy': np.array(all_hr_proxy, dtype=np.float32),
             'hrv_proxy': np.array(all_hrv_proxy, dtype=np.float32),
         }
+        if len(all_context_energy) == len(all_true_countdown):
+            viz_payload['context_energy'] = np.array(all_context_energy, dtype=np.float32)
+        if len(all_eeg_proxy) == len(all_ecg_proxy) and len(all_eeg_proxy) > 0:
+            viz_payload['eeg_proxy'] = np.array(all_eeg_proxy, dtype=np.float32)
+
+        val_dataset = getattr(val_loader, 'seizure_dataset', getattr(val_loader, 'dataset', None))
+        self._cached_val_dataset_ref = val_dataset
+        sample_end_times_s = getattr(val_dataset, 'sample_end_times_s', None) if val_dataset is not None else None
+        recording_ids = getattr(val_dataset, 'recording_ids', None) if val_dataset is not None else None
+        n_points = int(len(all_true_countdown))
+        if (
+            sample_end_times_s is not None
+            and recording_ids is not None
+            and len(sample_end_times_s) >= n_points
+            and len(recording_ids) >= n_points
+            and n_points > 0
+        ):
+            viz_payload['sample_end_times_s'] = np.asarray(sample_end_times_s[:n_points], dtype=np.float32)
+            viz_payload['recording_ids'] = np.asarray(recording_ids[:n_points])
+
+        recordings_meta = getattr(val_dataset, 'recordings_meta', None) if val_dataset is not None else None
+        if recordings_meta is not None:
+            viz_payload['recordings_meta'] = recordings_meta
+
         return dict(metrics), viz_payload
     
     def create_model_optimizer_scheduler(self) -> Tuple[nn.Module, optim.Optimizer, object]:
@@ -1534,9 +1941,16 @@ class Trainer:
         
         return model, optimizer, scheduler
     
-    def train_epoch(self, model: nn.Module, train_loader: DataLoader,
-                   criterion: nn.Module, optimizer: optim.Optimizer,
-                   epoch: int) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+    def train_epoch(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        criterion: nn.Module,
+        optimizer: optim.Optimizer,
+        epoch: int,
+        val_loader=None,
+        visualization_indices: Optional[List[Tuple[int, int]]] = None,
+    ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
         """Train for one epoch.
         
         Args:
@@ -1552,6 +1966,7 @@ class Trainer:
         model.train()
         
         metrics = defaultdict(float)
+        batch_loss_ema = None
         num_batches = 0
         all_pred_preictal = []
         all_true_preictal = []
@@ -1568,6 +1983,17 @@ class Trainer:
             desc=f"Train Epoch {epoch}",
             total=len(train_loader)
         )
+        visualization_index_map = {idx: q for idx, q in (visualization_indices or [])}
+        distributed_viz_sync = bool(self.distributed)
+        if self.distributed and visualization_index_map and not self._distributed_train_loader_lengths_match(train_loader):
+            if self._is_main_process():
+                logger.warning(
+                    "Unequal distributed train loader lengths detected; "
+                    "running intermediate quarter-epoch visualizations on rank 0 without cross-rank barriers."
+                )
+            distributed_viz_sync = False
+            if not self._is_main_process():
+                visualization_index_map = {}
 
         # Track last gradient norm for debugging numerical issues
         last_grad_norm: Optional[float] = None
@@ -1678,6 +2104,17 @@ class Trainer:
             return step_grad_norm
 
         for batch_idx, batch in train_iter:
+            if (not model.training) or (isinstance(model, DDP) and not model.module.training):
+                logger.warning(
+                    "Model switched to eval mode during training loop; restoring train mode "
+                    "(epoch=%d, batch=%d).",
+                    int(epoch),
+                    int(batch_idx),
+                )
+                model.train()
+                if isinstance(model, DDP):
+                    model.module.train()
+
             # Move data to device
             features = batch[0].to(self.device)
             labels = batch[1].to(self.device)
@@ -1799,6 +2236,7 @@ class Trainer:
             # Log batch
             if batch_idx % self.training_config.log_interval == 0 and self._is_main_process():
                 avg_loss = metrics['train_total'] / num_batches
+                batch_loss_ema = avg_loss if batch_loss_ema is None else (0.98 * batch_loss_ema + 0.02 * avg_loss)
                 if last_grad_norm is not None:
                     logger.info(
                         f"Epoch {epoch} [{batch_idx}/{len(train_loader)}] Loss: {avg_loss:.4f} "
@@ -1815,40 +2253,79 @@ class Trainer:
                         "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                         "steps": optimizer_steps,
                     })
-                
-                # Log to wandb
+
                     if self.wandb_run:
                         log_payload = {
                             "epoch": epoch,
                             "batch": batch_idx,
                             "train/batch_loss": avg_loss,
+                            "train/batch_loss_ema": batch_loss_ema,
                             "train/learning_rate": optimizer.param_groups[0]['lr'],
                             "train/optimizer_steps": optimizer_steps,
                         }
                         if last_grad_norm is not None:
                             log_payload["train/grad_norm"] = last_grad_norm
                         wandb.log(log_payload)
-        
-        # Average metrics over epoch
-        for key in metrics:
-            metrics[key] /= num_batches
 
-        train_viz_payload = {
-            'pred_preictal': np.array(all_pred_preictal, dtype=np.float32),
-            'true_preictal': np.array(all_true_preictal, dtype=np.float32),
-        }
+                if batch_idx in visualization_index_map:
+                    if distributed_viz_sync:
+                        dist.barrier()
 
-        if len(all_patient_ids) == len(all_pred_preictal) and len(all_patient_ids) > 0:
-            patient_summary = _compute_patient_difficulty_summary(
-                pred_preictal=np.array(all_pred_preictal, dtype=np.float32),
-                true_preictal=np.array(all_true_preictal, dtype=np.float32),
-                pred_countdown=np.array(all_pred_countdown, dtype=np.float32),
-                true_countdown=np.array(all_true_countdown, dtype=np.float32),
-                patient_ids=np.asarray(all_patient_ids),
-                threshold=float(self.config.loss.detection_threshold),
-                countdown_max_minutes=float(self.config.model.output_countdown_max),
-                top_k=5,
-            )
+                    if self._is_main_process():
+                        quarter = visualization_index_map[batch_idx]
+                        suffix = f"q{quarter}"
+                        logger.info(
+                            "Starting intermediate visualization checkpoint %s at epoch %d batch %d/%d",
+                            suffix,
+                            int(epoch),
+                            int(batch_idx),
+                            int(len(train_loader)),
+                        )
+                        self._run_visualization_checkpoint(
+                            model,
+                            val_loader,
+                            criterion,
+                            epoch,
+                            train_viz_payload={
+                                'pred_preictal': np.array(all_pred_preictal, dtype=np.float32),
+                                'true_preictal': np.array(all_true_preictal, dtype=np.float32),
+                            },
+                            suffix=suffix,
+                        )
+                        logger.info(
+                            "Completed intermediate visualization checkpoint %s at epoch %d",
+                            suffix,
+                            int(epoch),
+                        )
+
+                    if distributed_viz_sync:
+                        try:
+                            from datetime import timedelta
+                            dist.barrier(timeout=timedelta(minutes=45))
+                        except TypeError:
+                            dist.barrier()
+
+            if len(all_patient_ids) > 0:
+                patient_summary = _compute_patient_difficulty_summary(
+                    pred_preictal=np.asarray(all_pred_preictal, dtype=np.float32),
+                    true_preictal=np.asarray(all_true_preictal, dtype=np.float32),
+                    pred_countdown=np.asarray(all_pred_countdown, dtype=np.float32),
+                    true_countdown=np.asarray(all_true_countdown, dtype=np.float32),
+                    patient_ids=np.asarray(all_patient_ids, dtype=str),
+                    threshold=float(getattr(self.config.loss, 'detection_threshold', 0.5)),
+                    countdown_max_minutes=float(getattr(self.config.model, 'output_countdown_max', 10.0)),
+                    top_k=5,
+                )
+            else:
+                patient_summary = {
+                    'n_samples': len(all_pred_preictal),
+                    'n_patients': 0,
+                    'threshold': float(getattr(self.config.loss, 'detection_threshold', 0.5)),
+                    'patient_rows': [],
+                    'hardest_patients': [],
+                    'easiest_patients': [],
+                }
+
             self._last_train_patient_summary = patient_summary
 
             hardest = patient_summary.get('hardest_patients', [])
@@ -1860,6 +2337,11 @@ class Trainer:
                 metrics['train_easiest_patient_difficulty'] = float(easiest[0].get('difficulty_score', 0.0))
                 metrics['train_easiest_patient_bal_acc'] = float(easiest[0].get('alert_balanced_accuracy', 0.0))
             metrics['train_patient_count'] = float(patient_summary.get('n_patients', 0))
+
+            train_viz_payload = {
+                'pred_preictal': np.array(all_pred_preictal, dtype=np.float32),
+                'true_preictal': np.array(all_true_preictal, dtype=np.float32),
+            }
         
         return dict(metrics), train_viz_payload
     
@@ -2172,19 +2654,30 @@ class Trainer:
         self._cached_val_dataset_ref = val_dataset
         sample_end_times_s = getattr(val_dataset, 'sample_end_times_s', None) if val_dataset is not None else None
         recording_ids = getattr(val_dataset, 'recording_ids', None) if val_dataset is not None else None
+        n_points = int(len(all_true_countdown))
         if (
             sample_end_times_s is not None
             and recording_ids is not None
-            and len(sample_end_times_s) == len(all_true_countdown)
-            and len(recording_ids) == len(all_true_countdown)
+            and len(sample_end_times_s) >= n_points
+            and len(recording_ids) >= n_points
+            and n_points > 0
         ):
-            viz_payload['sample_end_times_s'] = np.asarray(sample_end_times_s, dtype=np.float32)
-            viz_payload['recording_ids'] = np.asarray(recording_ids)
+            viz_payload['sample_end_times_s'] = np.asarray(sample_end_times_s[:n_points], dtype=np.float32)
+            viz_payload['recording_ids'] = np.asarray(recording_ids[:n_points])
+
+        recordings_meta = getattr(val_dataset, 'recordings_meta', None) if val_dataset is not None else None
+        if recordings_meta is not None:
+            viz_payload['recordings_meta'] = recordings_meta
 
         return dict(metrics), viz_payload
 
-    def _save_epoch_visualizations(self, epoch: int, viz_payload: Dict[str, np.ndarray],
-                                   train_viz_payload: Optional[Dict[str, np.ndarray]] = None) -> None:
+    def _save_epoch_visualizations(
+        self,
+        epoch: int,
+        viz_payload: Dict[str, np.ndarray],
+        train_viz_payload: Optional[Dict[str, np.ndarray]] = None,
+        suffix: Optional[str] = None,
+    ) -> None:
         """Save per-epoch validation visualizations on main process."""
         if not self._is_main_process() or self.epoch_visualizer is None:
             return
@@ -2198,6 +2691,7 @@ class Trainer:
         pred_preictal_only_prob_full = viz_payload.get('pred_preictal_only_prob')
         true_state_full = viz_payload.get('true_state')
         pred_state_full = viz_payload.get('pred_state')
+        context_energy_full = viz_payload.get('context_energy')
 
         # Prefer explicit ECG/EEG proxies when available, but fall back to
         # the original single-channel signal_proxy for backward compatibility.
@@ -2208,6 +2702,7 @@ class Trainer:
         adxl_proxy = viz_payload.get('adxl_proxy', None)
         hr_proxy = viz_payload.get('hr_proxy', np.zeros_like(ecg_proxy, dtype=np.float32))
         hrv_proxy = viz_payload.get('hrv_proxy', np.zeros_like(ecg_proxy, dtype=np.float32))
+        eeg_signal_label = str(viz_payload.get('eeg_signal_label', 'EEG proxy'))
 
         # Prefer a contiguous segment from a single recording that includes a
         # seizure (when metadata is available and we are not in distributed
@@ -2286,6 +2781,11 @@ class Trainer:
             if pred_state_full is not None and len(pred_state_full) == len(viz_payload['pred_preictal'])
             else None
         )
+        context_energy = (
+            np.asarray(context_energy_full, dtype=np.float32)[selected]
+            if context_energy_full is not None and len(context_energy_full) == len(viz_payload['pred_preictal'])
+            else None
+        )
         pred_preictal_smooth_sel = viz_payload.get('pred_preictal_smooth')
         if pred_preictal_smooth_sel is not None:
             pred_preictal_smooth_sel = pred_preictal_smooth_sel[selected]
@@ -2300,6 +2800,10 @@ class Trainer:
         hrv_proxy_raw = hrv_proxy[selected]
         emg_proxy_raw: Optional[np.ndarray] = None
         mov_proxy_raw: Optional[np.ndarray] = None
+
+        if getattr(self.config.data, 'data_source', 'bids') != 'wearable':
+            hr_proxy_raw = np.clip(60.0 + 30.0 * np.asarray(hr_proxy_raw, dtype=np.float32), 30.0, 180.0).astype(np.float32)
+            hrv_proxy_raw = np.clip(20.0 + 40.0 * np.asarray(hrv_proxy_raw, dtype=np.float32), 0.0, 250.0).astype(np.float32)
 
         # Rebuild a dense timeline (default 1 Hz) for metadata-backed BIDS
         # panels so overlays do not look sparsely sampled when validation
@@ -2320,18 +2824,48 @@ class Trainer:
             times_sel = times_all[selected]
 
             uniq_rec, counts = np.unique(rec_ids_sel, return_counts=True)
-            chosen_rec = str(uniq_rec[int(np.argmax(counts))]) if uniq_rec.size > 0 else None
+            panel_loader = None
+            if getattr(self.config.data, 'data_source', 'bids') != 'wearable':
+                try:
+                    from src.data_loader import BIDSDataLoader as _BIDSLoader
+                    panel_loader = _BIDSLoader(self.config.data)
+                except Exception:
+                    panel_loader = None
+
+            chosen_rec = _choose_panel_recording_uid(rec_ids_sel, rec_ids_all, panel_loader)
             if chosen_rec is not None:
                 keep = rec_ids_sel == chosen_rec
+                if not np.any(keep):
+                    rec_all_times = np.sort(times_all[rec_ids_all == chosen_rec])
+                    if rec_all_times.size >= 2:
+                        center_s = float(rec_all_times[rec_all_times.size // 2])
+                        half_window_s = max(60.0, panel_window_minutes * 30.0)
+                        start_s = max(float(rec_all_times[0]), center_s - half_window_s)
+                        end_s = min(float(rec_all_times[-1]), center_s + half_window_s)
+                        if end_s <= start_s:
+                            start_s = float(rec_all_times[0])
+                            end_s = float(rec_all_times[-1])
+                        global_mask = (rec_ids_all == chosen_rec) & (times_all >= start_s) & (times_all <= end_s)
+                        sel_local = np.where(global_mask)[0]
+                        if sel_local.size >= 2:
+                            t_local = np.asarray(times_all[sel_local], dtype=np.float64)
+                            order = np.argsort(t_local)
+                            sel_local = sel_local[order]
+                            t_local = t_local[order]
+                            dense_step_s = float(max(0.5, getattr(self.training_config, 'epoch_panel_dense_step_s', 1.0)))
+                            dense_t = np.arange(float(t_local[0]), float(t_local[-1]) + dense_step_s * 0.5, dense_step_s, dtype=np.float64)
+                            keep = np.ones(sel_local.shape[0], dtype=bool)
                 if np.any(keep):
-                    sel_local = selected[keep]
-                    t_local = np.asarray(times_all[sel_local], dtype=np.float64)
-                    order = np.argsort(t_local)
-                    sel_local = sel_local[order]
-                    t_local = t_local[order]
+                    if 'sel_local' not in locals() or sel_local.size == 0:
+                        sel_local = selected[keep]
+                        t_local = np.asarray(times_all[sel_local], dtype=np.float64)
+                        order = np.argsort(t_local)
+                        sel_local = sel_local[order]
+                        t_local = t_local[order]
 
                     dense_step_s = float(max(0.5, getattr(self.training_config, 'epoch_panel_dense_step_s', 1.0)))
-                    dense_t = np.arange(float(t_local[0]), float(t_local[-1]) + dense_step_s * 0.5, dense_step_s, dtype=np.float64)
+                    if 'dense_t' not in locals() or dense_t.size == 0:
+                        dense_t = np.arange(float(t_local[0]), float(t_local[-1]) + dense_step_s * 0.5, dense_step_s, dtype=np.float64)
 
                     if dense_t.size >= 8:
                         # Interpolate predictions/targets to the dense timeline.
@@ -2359,19 +2893,24 @@ class Trainer:
                             true_state = np.rint(_interp_to_grid(t_local, np.asarray(true_state, dtype=np.float32)[keep][order], dense_t)).astype(np.int32)
                         if pred_state is not None:
                             pred_state = np.rint(_interp_to_grid(t_local, np.asarray(pred_state, dtype=np.float32)[keep][order], dense_t)).astype(np.int32)
+                        if context_energy is not None:
+                            context_energy = _interp_to_grid(t_local, np.asarray(context_energy, dtype=np.float32)[keep][order], dense_t)
 
                         # Start from interpolated proxies, then override with
                         # dense raw streams when available.
-                        ecg_proxy_raw = _interp_to_grid(t_local, np.asarray(ecg_proxy_raw, dtype=np.float32)[keep][order], dense_t)
-                        ppg_proxy_raw = _interp_to_grid(t_local, np.asarray(ppg_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                        ecg_proxy_local = np.asarray(viz_payload.get('ecg_proxy', viz_payload.get('signal_proxy')), dtype=np.float32)[sel_local]
+                        ppg_source = viz_payload.get('ppg_proxy', viz_payload.get('ecg_proxy', viz_payload.get('signal_proxy')))
+                        ppg_proxy_local = np.asarray(ppg_source, dtype=np.float32)[sel_local]
+                        ecg_proxy_raw = _interp_to_grid(t_local, ecg_proxy_local, dense_t)
+                        ppg_proxy_raw = _interp_to_grid(t_local, ppg_proxy_local, dense_t)
                         if eda_proxy_raw is not None:
-                            eda_proxy_raw = _interp_to_grid(t_local, np.asarray(eda_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                            eda_proxy_raw = _interp_to_grid(t_local, np.asarray(viz_payload['eda_proxy'], dtype=np.float32)[sel_local], dense_t)
                         if eeg_proxy_raw is not None:
-                            eeg_proxy_raw = _interp_to_grid(t_local, np.asarray(eeg_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                            eeg_proxy_raw = _interp_to_grid(t_local, np.asarray(viz_payload['eeg_proxy'], dtype=np.float32)[sel_local], dense_t)
                         if adxl_proxy_raw is not None:
-                            adxl_proxy_raw = _interp_to_grid(t_local, np.asarray(adxl_proxy_raw, dtype=np.float32)[keep][order], dense_t)
-                        hr_proxy_raw = _interp_to_grid(t_local, np.asarray(hr_proxy_raw, dtype=np.float32)[keep][order], dense_t)
-                        hrv_proxy_raw = _interp_to_grid(t_local, np.asarray(hrv_proxy_raw, dtype=np.float32)[keep][order], dense_t)
+                            adxl_proxy_raw = _interp_to_grid(t_local, np.asarray(viz_payload['adxl_proxy'], dtype=np.float32)[sel_local], dense_t)
+                        hr_proxy_raw = _interp_to_grid(t_local, np.asarray(hr_proxy, dtype=np.float32)[sel_local], dense_t)
+                        hrv_proxy_raw = _interp_to_grid(t_local, np.asarray(hrv_proxy, dtype=np.float32)[sel_local], dense_t)
 
                         # Use cached ECG binary when available in LazyRealDataset metadata.
                         try:
@@ -2410,18 +2949,37 @@ class Trainer:
                         # same recording to keep modality overlays visible.
                         try:
                             parsed = _parse_recording_uid(chosen_rec)
-                            if parsed is not None:
-                                from src.data_loader import BIDSDataLoader as _BIDSLoader
-
+                            if parsed is not None and panel_loader is not None:
                                 sub_id, ses_id, run_id = parsed
-                                panel_loader = _BIDSLoader(self.config.data)
 
                                 def _load_dense_modality(datatype: str) -> Optional[np.ndarray]:
+                                    nonlocal eeg_signal_label
                                     try:
                                         data, fs_local = panel_loader.load_subject_edf(sub_id, ses_id, datatype, run_id)
                                         if data is None:
                                             return None
-                                        arr = data[0] if np.asarray(data).ndim > 1 else np.asarray(data)
+                                        arr = np.asarray(data, dtype=np.float32)
+                                        if arr.ndim > 1:
+                                            if datatype in ('eeg', 'emg'):
+                                                ch_std = np.nanstd(arr, axis=1)
+                                                if np.any(np.isfinite(ch_std)):
+                                                    best_ch = int(np.nanargmax(ch_std))
+                                                else:
+                                                    best_ch = 0
+                                                arr = arr[best_ch]
+                                                if datatype == 'eeg':
+                                                    eeg_signal_label = f'EEG (ch{best_ch}, dense raw)'
+                                            elif datatype == 'mov':
+                                                arr = np.sqrt(np.mean(arr ** 2, axis=0))
+                                            else:
+                                                ch_std = np.nanstd(arr, axis=1)
+                                                if np.any(np.isfinite(ch_std)):
+                                                    best_ch = int(np.nanargmax(ch_std))
+                                                else:
+                                                    best_ch = 0
+                                                arr = arr[best_ch]
+                                        elif datatype == 'eeg':
+                                            eeg_signal_label = 'EEG (dense raw)'
                                         arr = np.asarray(arr, dtype=np.float32).reshape(-1)
                                         if arr.size == 0 or fs_local <= 0:
                                             return None
@@ -2430,10 +2988,13 @@ class Trainer:
                                     except Exception:
                                         return None
 
+                                ecg_raw = _load_dense_modality('ecg')
                                 eeg_raw = _load_dense_modality('eeg')
                                 emg_raw = _load_dense_modality('emg')
                                 mov_raw = _load_dense_modality('mov')
 
+                                if ecg_raw is not None:
+                                    ecg_proxy_raw = ecg_raw
                                 if eeg_raw is not None:
                                     eeg_proxy_raw = eeg_raw
                                 if emg_raw is not None:
@@ -2466,7 +3027,7 @@ class Trainer:
             ecg_proxy_plot = ecg_proxy_raw.astype(np.float32)
         ppg_proxy_plot = _standardize_for_plot(ppg_proxy_raw)
         eda_proxy_plot = _standardize_for_plot(eda_proxy_raw) if eda_proxy_raw is not None else None
-        eeg_proxy_plot = eeg_proxy_raw.astype(np.float32) if eeg_proxy_raw is not None else None
+        eeg_proxy_plot = _standardize_for_plot(eeg_proxy_raw) if eeg_proxy_raw is not None else None
         adxl_proxy_plot = adxl_proxy_raw if adxl_proxy_raw is not None else None
         # For wearable runs, keep HR/HRV proxies in their synthetic
         # physiological units so that plots show meaningful ranges instead of
@@ -2474,13 +3035,10 @@ class Trainer:
         # version. For BIDS ECG runs, standardize for better visual contrast.
         if getattr(self.config.data, "data_source", "bids") == "wearable":
             hr_proxy_plot = hr_proxy_raw.astype(np.float32)
-            if np.allclose(hrv_proxy_raw, 0.0):
-                hrv_proxy_plot = hr_proxy_raw.astype(np.float32)
-            else:
-                hrv_proxy_plot = hrv_proxy_raw.astype(np.float32)
+            hrv_proxy_plot = hrv_proxy_raw.astype(np.float32)
         else:
             hr_proxy_plot = hr_proxy_raw.astype(np.float32)
-            hrv_proxy_plot = (hr_proxy_raw if np.allclose(hrv_proxy_raw, 0.0) else hrv_proxy_raw).astype(np.float32)
+            hrv_proxy_plot = hrv_proxy_raw.astype(np.float32)
 
         # Runtime/local inference accuracy using local history only.
         gt_binary = (true_countdown >= 0).astype(np.float32)
@@ -2491,10 +3049,7 @@ class Trainer:
         )
         pred_binary = (panel_alarm_prob >= float(self.config.loss.detection_threshold)).astype(np.float32)
         acc_window = max(3, int(getattr(self.training_config, 'epoch_panel_accuracy_window', 31)))
-        local_accuracy = np.zeros_like(gt_binary, dtype=np.float32)
-        for i in range(len(local_accuracy)):
-            left = max(0, i - acc_window + 1)
-            local_accuracy[i] = float(np.mean((pred_binary[left:i + 1] == gt_binary[left:i + 1]).astype(np.float32)))
+        local_accuracy = _compute_local_balanced_accuracy(gt_binary, pred_binary, acc_window)
 
         gt_event_mask = np.zeros_like(gt_binary, dtype=np.int32)
         if len(gt_binary) > 0:
@@ -2645,8 +3200,8 @@ class Trainer:
 
         fig_panel = self.epoch_visualizer.plot_gt_vs_inference_panel(
             ecg_signal=ecg_proxy_plot,
-            ppg_signal=ppg_proxy_plot,
-            eda_signal=eda_proxy_plot,
+            ppg_signal=ppg_proxy_plot if data_source == 'wearable' else None,
+            eda_signal=eda_proxy_plot if data_source == 'wearable' else None,
             eeg_signal=eeg_proxy_plot,
             emg_signal=emg_proxy_raw,
             mov_signal=mov_proxy_raw,
@@ -2667,6 +3222,7 @@ class Trainer:
             title_prefix=f"{self.config.model.model_type} — {dataset_tag} — epoch {epoch}",
             footer_text=panel_footer,
             signal_label=signal_label,
+            eeg_signal_label=eeg_signal_label,
             pred_onset_prob=pred_onset_prob,
             pred_preictal_only_prob=pred_preictal_only_prob,
             gt_onset=None if true_state is None else (true_state == 2).astype(np.int32),
@@ -2678,8 +3234,9 @@ class Trainer:
             local_accuracy=local_accuracy,
             gt_event_mask=gt_event_mask,
             data_source=data_source,
+            context_energy=context_energy,
         )
-        panel_filename = f"epoch_{epoch:03d}_gt_vs_inference_panel"
+        panel_filename = f"epoch_{epoch:03d}{('_' + suffix) if suffix else ''}_gt_vs_inference_panel"
         self.epoch_visualizer.save_figure(fig_panel, panel_filename, step=epoch)
 
         # Automated anomaly checks for panel inputs; persist machine-readable
@@ -2697,6 +3254,7 @@ class Trainer:
                 emg_signal=None if emg_proxy_raw is None else np.asarray(emg_proxy_raw, dtype=np.float32),
                 mov_signal=None if mov_proxy_raw is None else np.asarray(mov_proxy_raw, dtype=np.float32),
                 token_roll=None if token_roll is None else np.asarray(token_roll, dtype=np.float32),
+                context_energy=None if context_energy is None else np.asarray(context_energy, dtype=np.float32),
             )
 
             monitor_dir = self.save_dir / "monitoring"
@@ -2820,7 +3378,18 @@ class Trainer:
                     )
                     log_payload['visualizations/alert_confusion_matrix_raw'] = wandb.Image(fig_alert_cm)
 
-                    smooth_probs = np.asarray(viz_payload.get('pred_preictal_smooth', viz_payload['pred_preictal']), dtype=np.float32)
+                    # Use a conservative smoothed signal for confusion analysis.
+                    # The panel can still display aggressive alert smoothing for
+                    # trend visibility, but confusion matrices should avoid
+                    # streak-bonus saturation that can collapse to all-alert.
+                    smooth_probs = _causal_smooth(
+                        np.asarray(viz_payload['pred_preictal'], dtype=np.float32),
+                        rise_alpha=0.25,
+                        fall_alpha=0.25,
+                        streak_threshold=1.0,
+                        streak_window=1,
+                        streak_max_bonus=0.0,
+                    )
                     smooth_metrics = _compute_binary_metrics(
                         (viz_payload['true_countdown'] >= 0).astype(np.int32),
                         smooth_probs,
@@ -2830,6 +3399,12 @@ class Trainer:
                         [int(smooth_metrics['tn']), int(smooth_metrics['fp'])],
                         [int(smooth_metrics['fn']), int(smooth_metrics['tp'])],
                     ], dtype=np.int32)
+                    logger.info(
+                        "Epoch %d alert CM raw tn/fp/fn/tp=%d/%d/%d/%d | smooth=%d/%d/%d/%d",
+                        int(epoch),
+                        int(alert_metrics['tn']), int(alert_metrics['fp']), int(alert_metrics['fn']), int(alert_metrics['tp']),
+                        int(smooth_metrics['tn']), int(smooth_metrics['fp']), int(smooth_metrics['fn']), int(smooth_metrics['tp']),
+                    )
                     fig_smooth_cm = _build_confusion_matrix_figure(
                         smooth_cm,
                         ('Interictal', 'Alert'),
@@ -2886,6 +3461,38 @@ class Trainer:
         _loss_type = str(getattr(self.config.loss, 'loss_type', 'countdown')).lower()
         criterion = LossFactory.create_loss(self.config.loss, loss_type=_loss_type)
         criterion = criterion.to(self.device)
+
+        preflight_enabled = bool(getattr(self.training_config, 'preflight_visualization', True))
+        preflight_max_batches_cfg = int(getattr(self.training_config, 'preflight_max_val_batches', 0))
+        preflight_max_batches = preflight_max_batches_cfg if preflight_max_batches_cfg > 0 else None
+        if preflight_enabled:
+            if self._is_main_process():
+                logger.info(
+                    "Running pre-training visualization preflight (max_val_batches=%s)",
+                    str(preflight_max_batches) if preflight_max_batches is not None else 'full',
+                )
+
+            if self.distributed:
+                dist.barrier()
+
+            if self._is_main_process():
+                self._run_visualization_checkpoint(
+                    model,
+                    val_loader,
+                    criterion,
+                    epoch=0,
+                    train_viz_payload=None,
+                    suffix='preflight',
+                    max_val_batches=preflight_max_batches,
+                )
+                logger.info("Pre-training visualization preflight completed")
+
+            if self.distributed:
+                try:
+                    from datetime import timedelta
+                    dist.barrier(timeout=timedelta(minutes=45))
+                except TypeError:
+                    dist.barrier()
         
         # Training history
         history = {
@@ -2934,23 +3541,40 @@ class Trainer:
                     )
 
             # Train
+            visualization_indices = self._get_visualization_indices(len(train_loader))
             if stateful_mode:
-                train_metrics, train_viz_payload = self.train_epoch_stateful(model, train_loader, criterion, optimizer, epoch)
+                train_metrics, train_viz_payload = self.train_epoch_stateful(
+                    model,
+                    train_loader,
+                    criterion,
+                    optimizer,
+                    epoch,
+                    val_loader=val_loader,
+                    visualization_indices=visualization_indices,
+                )
             else:
-                train_metrics, train_viz_payload = self.train_epoch(model, train_loader, criterion, optimizer, epoch)
+                train_metrics, train_viz_payload = self.train_epoch(
+                    model,
+                    train_loader,
+                    criterion,
+                    optimizer,
+                    epoch,
+                    val_loader=val_loader,
+                    visualization_indices=visualization_indices,
+                )
             
             # Validate
             if stateful_mode:
                 if self.distributed:
-                    if self.device.type == 'cuda':
-                        dist.barrier(device_ids=[self.local_rank])
-                    else:
-                        dist.barrier()
+                    dist.barrier()
                 val_metrics, viz_payload = self.validate_stateful(model, val_loader, criterion)
                 if self.distributed:
-                    if self.device.type == 'cuda':
-                        dist.barrier(device_ids=[self.local_rank])
-                    else:
+                    # Some stateful validation runs can exceed the default NCCL barrier
+                    # timeout (10 minutes). Use a longer wait for rank synchronization.
+                    try:
+                        from datetime import timedelta
+                        dist.barrier(timeout=timedelta(minutes=45))
+                    except TypeError:
                         dist.barrier()
             else:
                 val_metrics, viz_payload = self.validate(model, val_loader, criterion)
@@ -3132,11 +3756,7 @@ class Trainer:
                             break
 
                 # Optional periodic checkpointing
-                if (
-                    not self.training_config.save_best_only
-                    and self.training_config.save_interval > 0
-                    and epoch % self.training_config.save_interval == 0
-                ):
+                if self.training_config.save_interval > 0 and epoch % self.training_config.save_interval == 0:
                     self._save_checkpoint(model, optimizer, epoch, checkpoint_name=f"epoch_{epoch:03d}.pt")
         
         elapsed_time = time.time() - start_time

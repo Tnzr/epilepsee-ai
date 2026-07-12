@@ -543,6 +543,22 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--training-mode',
+        type=str,
+        choices=['stateful', 'stateless'],
+        default=None,
+        help='Training mode override: stateful or stateless. If omitted, config default is used.'
+    )
+
+    parser.add_argument(
+        '--batching-strategy',
+        type=str,
+        choices=['patient_sequential', 'random'],
+        default=None,
+        help='Batching strategy override for stateful/stateless training.'
+    )
+
+    parser.add_argument(
         '--augment-preictal',
         dest='augment_preictal',
         action='store_true',
@@ -569,6 +585,28 @@ def parse_args():
         type=float,
         default=60.0,
         help='Window length in minutes for final GT-vs-inference panel (default: 60, approximately -30/+30 around onset)'
+    )
+
+    parser.add_argument(
+        '--preflight-visualization',
+        dest='preflight_visualization',
+        action='store_true',
+        default=True,
+        help='Run an early visualization checkpoint before epoch 1 to fail fast on plotting/panel issues.'
+    )
+
+    parser.add_argument(
+        '--no-preflight-visualization',
+        dest='preflight_visualization',
+        action='store_false',
+        help='Disable pre-training visualization preflight checkpoint.'
+    )
+
+    parser.add_argument(
+        '--preflight-max-val-batches',
+        type=int,
+        default=0,
+        help='Maximum validation batches used for preflight visualization (default: 0, meaning full validation pass).'
     )
 
     parser.add_argument(
@@ -1643,7 +1681,7 @@ def _ensure_nonempty_splits(
     return train_idx, val_idx, test_idx
 
 
-def _prepare_real_datasets(config: Config, args, loader: BIDSDataLoader, recordings: List[dict]):
+def _prepare_real_datasets(config: Config, args, loader: BIDSDataLoader, recordings: List[dict], patient_sequential: bool = False):
     """Build lazy streaming datasets from real BIDS ECG recordings.
 
     Instead of pre-computing and storing feature tensors (which would require
@@ -1824,7 +1862,7 @@ def _prepare_real_datasets(config: Config, args, loader: BIDSDataLoader, recordi
     recording_ids = np.array(all_rec_ids)
 
     # --- train/val/test split --------------------------------------------------
-    if args.patient_sequential:
+    if patient_sequential:
         train_idx, val_idx, test_idx = _split_indices_by_patient_sequential(
             labels_arr,
             recording_ids=recording_ids,
@@ -1858,9 +1896,9 @@ def _prepare_real_datasets(config: Config, args, loader: BIDSDataLoader, recordi
     def _make_subject_ids(idx):
         return np.array([r.split("_")[0].replace("sub-", "") for r in recording_ids[idx]])
 
-    subject_ids_train = _make_subject_ids(train_idx) if args.patient_sequential else None
-    subject_ids_val = _make_subject_ids(val_idx) if args.patient_sequential else None
-    subject_ids_test = _make_subject_ids(test_idx) if args.patient_sequential else None
+    subject_ids_train = _make_subject_ids(train_idx) if patient_sequential else None
+    subject_ids_val = _make_subject_ids(val_idx) if patient_sequential else None
+    subject_ids_test = _make_subject_ids(test_idx) if patient_sequential else None
 
     def _make_split(idx, subject_ids):
         return LazyRealDataset(
@@ -1893,7 +1931,7 @@ def _prepare_real_datasets(config: Config, args, loader: BIDSDataLoader, recordi
     return train_dataset, val_dataset, test_dataset
 
 
-def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataLoader, recordings: List[dict]):
+def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataLoader, recordings: List[dict], patient_sequential: bool = False):
     """Build datasets from wearable recordings and absolute seizure-time annotations."""
     logger.info("Preparing REAL dataset from wearable CSV streams + master seizure annotations...")
     prep_start = time.time()
@@ -2319,7 +2357,7 @@ def _prepare_wearable_datasets(config: Config, args, loader: WearableDeviceDataL
     test_recording_ids = recording_ids[test_idx]
     n_total = len(y)
 
-    if args.long_sweep_training or args.patient_sequential:
+    if args.long_sweep_training or patient_sequential:
         logger.info("Long-sweep mode: using online preictal augmentation (no offline expansion)")
         train_sample_end_times_s = sample_end_times_s[train_idx]
         train_recording_ids = recording_ids[train_idx]
@@ -2557,6 +2595,11 @@ def prepare_datasets(config: Config, args):
             args.data_mode = 'dummy'
 
     if args.data_mode == 'real':
+        patient_sequential = bool(
+            args.patient_sequential
+            or (str(getattr(config.training, 'training_mode', 'stateless')).lower() == 'stateful'
+                and str(getattr(config.training, 'batching_strategy', 'random')).lower() == 'patient_sequential')
+        )
         world_size = int(os.environ.get('WORLD_SIZE', '1'))
         rank = int(os.environ.get('RANK', '0'))
         cache_path = _real_cache_path(config, args)
@@ -2569,9 +2612,9 @@ def prepare_datasets(config: Config, args):
 
         if world_size == 1 or rank == 0:
             if args.data_source == 'wearable':
-                prepared = _prepare_wearable_datasets(config, args, wearable_loader, recordings)
+                prepared = _prepare_wearable_datasets(config, args, wearable_loader, recordings, patient_sequential=patient_sequential)
             else:
-                prepared = _prepare_real_datasets(config, args, loader, recordings)
+                prepared = _prepare_real_datasets(config, args, loader, recordings, patient_sequential=patient_sequential)
             if prepared is not None:
                 _save_real_dataset_cache(cache_path, *prepared)
                 logger.info(f"Saved real dataset cache: {cache_path}")
@@ -2727,6 +2770,10 @@ def main():
     if args.patient_sequential:
         config.training.long_sweep_training = True
         config.training.use_weighted_sampling = False
+    if args.training_mode is not None:
+        config.training.training_mode = str(args.training_mode)
+    if args.batching_strategy is not None:
+        config.training.batching_strategy = str(args.batching_strategy)
     config.training.optimizer_step_scope = str(args.optimizer_step_scope)
     config.training.patients_per_step = max(1, int(args.patients_per_step))
     if args.augment_preictal is not None:
@@ -2735,6 +2782,8 @@ def main():
         config.data.online_preictal_augmentation_prob = float(np.clip(args.online_aug_prob, 0.0, 1.0))
     if args.bayes_memory_eval is not None:
         config.evaluation.enable_bayesian_memory_eval = bool(args.bayes_memory_eval)
+    config.training.preflight_visualization = bool(getattr(args, 'preflight_visualization', True))
+    config.training.preflight_max_val_batches = int(getattr(args, 'preflight_max_val_batches', 0))
     if args.dataset_root:
         config.data.dataset_root = args.dataset_root
     elif args.data_source == 'wearable':
@@ -3251,7 +3300,15 @@ def main():
         and rec_ids_meta is not None
         and times_meta is not None
         and len(panel_indices) >= 2
-        and panel_effective_hz < 0.2
+    )
+    logger.info(
+        "Panel dense rebuild eval | data_source=%s | LazyReal=%s | rec_meta=%s | times_meta=%s | panel_indices=%d | loader=%s",
+        data_source,
+        isinstance(test_dataset, LazyRealDataset),
+        rec_ids_meta is not None,
+        times_meta is not None,
+        len(panel_indices),
+        'ok' if panel_loader is not None else 'missing',
     )
 
     if can_dense_rebuild:
@@ -3553,6 +3610,15 @@ def main():
                                     float(np.std(panel_eeg_raw)),
                                     float(np.std(panel_emg_raw)))
 
+                    logger.info(
+                        "Dense panel raw stats | eeg=%s | emg=%s | mov=%s | hr=%s | hrv=%s",
+                        None if panel_eeg_raw is None else (float(np.min(panel_eeg_raw)), float(np.max(panel_eeg_raw)), float(np.std(panel_eeg_raw))),
+                        None if panel_emg_raw is None else (float(np.min(panel_emg_raw)), float(np.max(panel_emg_raw)), float(np.std(panel_emg_raw))),
+                        None if panel_mov_raw is None else (float(np.min(panel_mov_raw)), float(np.max(panel_mov_raw)), float(np.std(panel_mov_raw))),
+                        None if panel_hr_raw is None else (float(np.min(panel_hr_raw)), float(np.max(panel_hr_raw)), float(np.std(panel_hr_raw))),
+                        None if panel_hrv_raw is None else (float(np.min(panel_hrv_raw)), float(np.max(panel_hrv_raw)), float(np.std(panel_hrv_raw))),
+                    )
+
                     panel_time_minutes = ((dense_times_abs_s - float(dense_times_abs_s[0])) / 60.0).astype(np.float64)
                     dense_panel_used = True
                     logger.info(
@@ -3750,9 +3816,11 @@ def main():
 
     panel_fig = visualizer.plot_gt_vs_inference_panel(
         ecg_signal=panel_ecg,
-        ppg_signal=panel_ppg,
-        eda_signal=panel_eda,
+        ppg_signal=panel_ppg if data_source == 'wearable' else None,
+        eda_signal=panel_eda if data_source == 'wearable' else None,
         eeg_signal=panel_eeg,
+        emg_signal=panel_emg_raw,
+        mov_signal=panel_mov_raw,
         adxl_series=panel_adxl,
         hr_series=panel_hr,
         hrv_series=panel_hrv,
@@ -3772,6 +3840,7 @@ def main():
         token_roll=panel_token_roll,
         token_window=len(panel_pred_preictal) if panel_token_roll is not None else None,
         token_labels=['Alert (raw)', 'Alert (smooth)', 'Imminence', 'GT preictal'] if panel_token_roll is not None else None,
+        data_source=data_source,
     )
     visualizer.save_figure(panel_fig, "gt_vs_inference_panel")
 
