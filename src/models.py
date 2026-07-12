@@ -99,6 +99,8 @@ class ECGCountdownPredictor(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(64, 1)
         )
+
+        self.last_context_state: Optional[torch.Tensor] = None
         
         self._init_weights()
     
@@ -129,11 +131,23 @@ class ECGCountdownPredictor(nn.Module):
             Tuple of (pre_ictal_prob, countdown_minutes, hidden_state)
             - For backward compatibility, hidden_state is only returned if requested
         """
+        use_cudnn_rnn = bool(getattr(self.config, 'use_cudnn_rnn', True))
+
         # LSTM with optional hidden state
         if hidden_state is None:
-            lstm_out, (h_n, c_n) = self.lstm(x)  # (batch, time, hidden*2)
+            if use_cudnn_rnn:
+                lstm_out, (h_n, c_n) = self.lstm(x)  # (batch, time, hidden*2)
+            else:
+                # Avoid cuDNN RNN mode-mismatch backward failures in long-running
+                # distributed jobs with intermittent eval checkpoints.
+                with torch.backends.cudnn.flags(enabled=False):
+                    lstm_out, (h_n, c_n) = self.lstm(x)
         else:
-            lstm_out, (h_n, c_n) = self.lstm(x, hidden_state)  # (batch, time, hidden*2)
+            if use_cudnn_rnn:
+                lstm_out, (h_n, c_n) = self.lstm(x, hidden_state)  # (batch, time, hidden*2)
+            else:
+                with torch.backends.cudnn.flags(enabled=False):
+                    lstm_out, (h_n, c_n) = self.lstm(x, hidden_state)
         
         # Attention
         if self.attention is not None:
@@ -143,6 +157,8 @@ class ECGCountdownPredictor(nn.Module):
         else:
             # Pooling: use final timestep
             pooled = lstm_out[:, -1, :]  # (batch, hidden*2)
+
+        self.last_context_state = pooled.detach()
         
         # Classification head
         pre_ictal_prob = self.fc_class[0](pooled)

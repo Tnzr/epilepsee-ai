@@ -392,6 +392,7 @@ class SignalVisualizer:
                                    token_window: Optional[int] = None,
                                    token_vmax: float = 1.0,
                                    token_labels: Optional[List[str]] = None,
+                                   context_energy: Optional[np.ndarray] = None,
                                    local_accuracy: Optional[np.ndarray] = None,
                                    gt_event_mask: Optional[np.ndarray] = None,
                                    data_source: str = 'bids') -> plt.Figure:
@@ -430,11 +431,12 @@ class SignalVisualizer:
         pred_preictal_only_prob = np.asarray(pred_preictal_only_prob, dtype=np.float32) if pred_preictal_only_prob is not None and len(pred_preictal_only_prob) == n_samples else None
         state_mode = str(visualization_mode).lower() == 'state' and pred_onset_prob is not None and pred_preictal_only_prob is not None
         pred_binary = (pred_preictal_prob >= detection_threshold).astype(int)
+        context_energy = np.asarray(context_energy, dtype=np.float32) if context_energy is not None and len(context_energy) == n_samples else None
 
         has_eeg = eeg_signal is not None and len(eeg_signal) == n_samples
-        add_token_row = token_roll is not None
-        n_left_rows = (5 if has_eeg else 4) + (1 if add_token_row else 0)
-        fig_h = figsize[1] + (2 if has_eeg else 0) + (2 if add_token_row else 0)
+        add_token_row = token_roll is not None or context_energy is not None
+        n_left_rows = (5 if has_eeg else 4) + (2 if add_token_row else 0)
+        fig_h = figsize[1] + (2 if has_eeg else 0) + (4 if add_token_row else 0)
 
         fig = plt.figure(figsize=(figsize[0], fig_h), constrained_layout=True)
         panel_title = 'GT vs Inference Panel (ECG/BPM | EMG/MOV/HRV | EEG | Heads | Heatmap)'
@@ -449,6 +451,7 @@ class SignalVisualizer:
         row_eeg    = 2 if has_eeg else None
         row_alarm  = 3 if has_eeg else 2
         row_heat   = 4 if has_eeg else 3
+        row_token_ctx = n_left_rows - 2 if add_token_row else None
         row_token  = n_left_rows - 1 if add_token_row else None
 
         # ── Left-1: PPG + EDA overlay ──────────────────────────────────────────
@@ -478,7 +481,96 @@ class SignalVisualizer:
         # misclassify runs and apply the wrong y-axis semantics.
         is_wearable = str(data_source).lower() == 'wearable'
 
-        if is_wearable and hr_series is not None and (eda_signal is not None and len(eda_signal) == len(hr_series)):
+        def _has_valid_signal(signal: Optional[np.ndarray]) -> bool:
+            if signal is None:
+                return False
+            if len(signal) != n_samples:
+                return False
+            arr = np.asarray(signal, dtype=np.float32)
+            if not np.any(np.isfinite(arr)):
+                return False
+            if np.allclose(arr, 0.0):
+                return False
+            return True
+
+        def _place_panel_legend(ax: plt.Axes,
+                                handles=None,
+                                labels=None,
+                                fontsize: int = 8) -> None:
+            if handles is None or labels is None:
+                handles, labels = ax.get_legend_handles_labels()
+            if not handles:
+                return
+            ncol = min(3, max(1, len(labels)))
+            ax.legend(
+                handles,
+                labels,
+                loc='lower left',
+                bbox_to_anchor=(0.0, 1.02, 1.0, 0.2),
+                mode='expand',
+                ncol=ncol,
+                borderaxespad=0.0,
+                fontsize=fontsize,
+                framealpha=0.9,
+            )
+
+        def _compute_token_context_summary(token_roll_arr: np.ndarray) -> Dict[str, np.ndarray]:
+            tok = np.asarray(token_roll_arr, dtype=np.float32)
+            if tok.ndim != 2 or tok.shape[0] == 0 or tok.shape[1] == 0:
+                empty = np.zeros(0, dtype=np.float32)
+                return {
+                    'dominant_strength': empty,
+                    'dominant_share': empty,
+                    'mean_strength': empty,
+                    'certainty': empty,
+                    'entropy': empty,
+                    'transition_density': empty,
+                    'dominant_index': np.zeros(0, dtype=np.int32),
+                }
+
+            clipped = np.clip(tok, 0.0, None)
+            row_sum = np.sum(clipped, axis=1, keepdims=True)
+            norm = np.divide(clipped, np.maximum(row_sum, 1e-6))
+            dominant_index = np.argmax(clipped, axis=1).astype(np.int32)
+            dominant_strength = np.max(clipped, axis=1).astype(np.float32)
+            dominant_share = np.max(norm, axis=1).astype(np.float32)
+            mean_strength = np.mean(clipped, axis=1).astype(np.float32)
+
+            entropy = -np.sum(norm * np.log(norm + 1e-12), axis=1)
+            entropy = (entropy / np.log(max(2, tok.shape[1]))).astype(np.float32)
+            certainty = np.clip(1.0 - entropy, 0.0, 1.0).astype(np.float32)
+
+            switch_events = np.zeros(tok.shape[0], dtype=np.float32)
+            if tok.shape[0] > 1:
+                switch_events[1:] = (dominant_index[1:] != dominant_index[:-1]).astype(np.float32)
+            window = max(3, min(25, tok.shape[0] // 20 if tok.shape[0] >= 20 else 3))
+            kernel = np.ones(window, dtype=np.float32) / float(window)
+            transition_density = np.convolve(switch_events, kernel, mode='same').astype(np.float32)
+
+            return {
+                'dominant_strength': dominant_strength,
+                'dominant_share': dominant_share,
+                'mean_strength': mean_strength,
+                'certainty': certainty,
+                'entropy': entropy,
+                'transition_density': transition_density,
+                'dominant_index': dominant_index,
+            }
+
+        def _rolling_mean(series: np.ndarray, window_samples: int) -> np.ndarray:
+            arr = np.asarray(series, dtype=np.float32)
+            if arr.size == 0:
+                return arr
+            w = int(max(1, window_samples))
+            if w <= 1:
+                return arr.copy()
+            kernel = np.ones(w, dtype=np.float32) / float(w)
+            return np.convolve(arr, kernel, mode='same').astype(np.float32)
+
+        has_eda = _has_valid_signal(eda_signal)
+        has_hr = hr_series is not None and len(hr_series) == n_samples and np.any(np.isfinite(hr_series))
+
+        if is_wearable and has_hr and has_eda:
             # Plot wearable HR only when enough samples are physiologically plausible.
             hr_arr = np.asarray(hr_series, dtype=np.float32)
             finite = np.isfinite(hr_arr)
@@ -502,7 +594,7 @@ class SignalVisualizer:
             # Add legends for both axes
             lines1, labels1 = ax_signal.get_legend_handles_labels()
             lines2, labels2 = ax_signal2.get_legend_handles_labels()
-            ax_signal.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
+            _place_panel_legend(ax_signal, lines1 + lines2, labels1 + labels2, fontsize=8)
             if np.any(np.isfinite(hr_plot)):
                 p1 = float(np.nanpercentile(hr_plot, 1.0))
                 p99 = float(np.nanpercentile(hr_plot, 99.0))
@@ -562,19 +654,39 @@ class SignalVisualizer:
                     bpm_axis.set_ylim(y_lo, y_hi)
                     bpm_axis.set_ylabel('Heart rate (BPM)', fontsize=9, color='dodgerblue')
                     bpm_axis.tick_params(axis='y', labelcolor='dodgerblue')
+                elif str(data_source).lower() == 'bids' and np.any(finite):
+                    hr_plot = np.where(finite, hr_arr, np.nan)
+                    bpm_axis = ax_signal.twinx()
+                    bpm_axis.plot(
+                        x_minutes,
+                        hr_plot,
+                        color='dodgerblue',
+                        linewidth=1.0,
+                        alpha=0.85,
+                        label='Estimated HR proxy',
+                    )
+                    y_lo = float(np.nanpercentile(hr_plot[np.isfinite(hr_plot)], 1.0)) if np.any(np.isfinite(hr_plot)) else 0.0
+                    y_hi = float(np.nanpercentile(hr_plot[np.isfinite(hr_plot)], 99.0)) if np.any(np.isfinite(hr_plot)) else 1.0
+                    if y_hi <= y_lo:
+                        y_lo -= 1.0
+                        y_hi += 1.0
+                    bpm_axis.set_ylim(y_lo, y_hi)
+                    bpm_axis.set_ylabel('Estimated HR proxy', fontsize=9, color='dodgerblue')
+                    bpm_axis.tick_params(axis='y', labelcolor='dodgerblue')
+                    logger.info('Showing BIDS HR proxy overlay with ratio=%.2f', plausible_ratio)
                 else:
                     logger.warning('Skipping BPM overlay: insufficient plausible BPM samples in panel (ratio=%.2f)', plausible_ratio)
 
-            if eda_signal is not None and len(eda_signal) == len(primary_signal):
+            if has_eda:
                 ax_signal.plot(x_minutes, eda_signal, color='seagreen',
                                linewidth=1.0, alpha=0.65, label='EDA proxy (raw)')
 
             lines1, labels1 = ax_signal.get_legend_handles_labels()
             if bpm_axis is not None:
                 lines2, labels2 = bpm_axis.get_legend_handles_labels()
-                ax_signal.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
+                _place_panel_legend(ax_signal, lines1 + lines2, labels1 + labels2, fontsize=8)
             else:
-                ax_signal.legend(loc='upper right', fontsize=8)
+                _place_panel_legend(ax_signal, fontsize=8)
         # Fill preictal/predicted regions (always on main axis)
         ax_signal.fill_between(x_minutes, ax_signal.get_ylim()[0], ax_signal.get_ylim()[1], where=gt_preictal > 0,
                                color='green', alpha=0.12, label='GT preictal')
@@ -585,7 +697,9 @@ class SignalVisualizer:
 
         # ── Left-2: ADXL (motion) + HRV dual axis ──────────────────────────────
         ax_adxl = fig.add_subplot(grid[row_adxl, 0], sharex=ax_signal)
-        hrv_clean = np.asarray(hrv_series, dtype=np.float32)
+
+        has_hrv = hrv_series is not None and len(hrv_series) == n_samples and np.any(np.isfinite(hrv_series))
+        hrv_clean = np.asarray(hrv_series, dtype=np.float32) if has_hrv else np.zeros(n_samples, dtype=np.float32)
 
         has_emg = emg_signal is not None and len(emg_signal) == n_samples
         has_mov = mov_signal is not None and len(mov_signal) == n_samples
@@ -620,24 +734,22 @@ class SignalVisualizer:
         ax_adxl.grid(True, alpha=0.25)
 
         ax_hrv2 = ax_adxl.twinx()
-        hrv_scaled = hrv_clean
-        hrv_label = 'HRV (native)'
-        ax_hrv2.plot(x_minutes, hrv_scaled, color='teal', linewidth=1.3, alpha=0.85, label=hrv_label)
+        hrv_label = 'HRV (ms)' if str(data_source).lower() == 'bids' else 'HRV (native)'
+        if has_hrv:
+            ax_hrv2.plot(x_minutes, hrv_clean, color='teal', linewidth=1.3, alpha=0.85, label=hrv_label)
         ax_hrv2.set_ylabel(hrv_label, color='teal', fontsize=9)
         ax_hrv2.tick_params(axis='y', labelcolor='teal')
         ax_adxl.set_title('EMG/MOV + HRV (dual axis)', fontweight='bold', fontsize=10)
 
         adxl_lines, adxl_lbls = ax_adxl.get_legend_handles_labels()
         hrv_lines, hrv_lbls = ax_hrv2.get_legend_handles_labels()
-        ax_adxl.legend(adxl_lines + hrv_lines, adxl_lbls + hrv_lbls, loc='upper right', fontsize=8)
+        _place_panel_legend(ax_adxl, adxl_lines + hrv_lines, adxl_lbls + hrv_lbls, fontsize=8)
 
         # ── Left-EEG (optional): dedicated EEG subplot ─────────────────────────
-        eeg_raw_stored = None  # Store for later use in alarm plot overlay
         ax_eeg_plot = None
         if has_eeg:
             ax_eeg_plot = fig.add_subplot(grid[row_eeg, 0], sharex=ax_signal)
             eeg_raw = np.asarray(eeg_signal, dtype=np.float32)
-            eeg_raw_stored = eeg_raw  # Store for alarm plot overlay
             ax_eeg_plot.plot(x_minutes, eeg_raw, color='purple', linewidth=1.0, alpha=0.85,
                              label=f'{eeg_signal_label} (raw)')
             y0, y1 = float(np.nanmin(eeg_raw)), float(np.nanmax(eeg_raw))
@@ -650,7 +762,7 @@ class SignalVisualizer:
             ax_eeg_plot.tick_params(axis='y', labelcolor='purple')
             ax_eeg_plot.set_ylim(y0, y1)
             ax_eeg_plot.grid(True, alpha=0.25)
-            ax_eeg_plot.legend(loc='upper right', fontsize=8)
+            _place_panel_legend(ax_eeg_plot, fontsize=8)
 
         # ── Left-alarm: smoothed alarm + countdown references ───────────────────
         ax_smooth = fig.add_subplot(grid[row_alarm, 0], sharex=ax_signal)
@@ -658,11 +770,20 @@ class SignalVisualizer:
         if has_smooth:
             ax_smooth.plot(
                 x_minutes,
+                np.clip(pred_preictal_prob, 0.0, 1.0),
+                color='orange',
+                linewidth=1.8,
+                alpha=0.75,
+                linestyle='--',
+                label='Alarm prob (raw)',
+            )
+            ax_smooth.plot(
+                x_minutes,
                 np.clip(pred_preictal_smooth, 0.0, 1.0),
                 color='goldenrod',
                 linewidth=2.0,
                 alpha=0.95,
-                label='Smoothed alarm',
+                label='Alarm prob (smoothed)',
             )
         else:
             ax_smooth.plot(
@@ -671,7 +792,7 @@ class SignalVisualizer:
                 color='peru',
                 linewidth=1.8,
                 alpha=0.95,
-                label='Raw alarm (smooth unavailable)',
+                label='Alarm prob',
             )
         ax_smooth.axhline(y=detection_threshold, color='red', linewidth=1.0,
                           linestyle='--', alpha=0.7, label=f'Threshold={detection_threshold:.2f}')
@@ -716,26 +837,9 @@ class SignalVisualizer:
                 label='Imminent risk prob (countdown head)',
             )
 
-        ax_acc = None
-        if local_acc is not None:
-            ax_acc = ax_smooth.twinx()
-            ax_acc.plot(
-                x_minutes,
-                local_acc,
-                color='deepskyblue',
-                linewidth=1.4,
-                alpha=0.8,
-                linestyle='-.',
-                label='Local rolling accuracy',
-            )
-            ax_acc.set_ylim(0.0, 1.0)
-            ax_acc.set_ylabel('Local accuracy', color='deepskyblue', fontsize=9)
-            ax_acc.tick_params(axis='y', labelcolor='deepskyblue')
-
         event_indices = np.where(gt_events > 0)[0]
-        max_event_lines = 12
-        if event_indices.size > max_event_lines:
-            event_indices = event_indices[-max_event_lines:]
+        if event_indices.size > 3:
+            event_indices = event_indices[-1:]
         for idx_ev, ev in enumerate(event_indices.tolist()):
             x_ev = float(x_minutes[ev])
             label = 'Past event' if idx_ev == 0 else None
@@ -757,34 +861,11 @@ class SignalVisualizer:
 
         ax_smooth.set_ylim(0.0, 1.0)
         ax_smooth.set_ylabel('Alarm prob')
-        
-        # Add EEG overlay to alarm plot if available
-        if eeg_raw_stored is not None and len(eeg_raw_stored) > 0 and np.any(np.isfinite(eeg_raw_stored)):
-            ax_eeg_overlay = ax_smooth.twinx()
-            eeg_min = np.nanmin(eeg_raw_stored)
-            eeg_max = np.nanmax(eeg_raw_stored)
-            if eeg_max > eeg_min:
-                eeg_scaled = (eeg_raw_stored - eeg_min) / (eeg_max - eeg_min)
-            else:
-                eeg_scaled = eeg_raw_stored
-            ax_eeg_overlay.plot(x_minutes, eeg_scaled, color='mediumpurple', linewidth=1.1, alpha=0.50, label='EEG activity')
-            ax_eeg_overlay.set_ylabel('EEG (scaled)', color='mediumpurple', fontsize=9)
-            ax_eeg_overlay.tick_params(axis='y', labelcolor='mediumpurple')
-            ax_eeg_overlay.set_ylim(0.0, 1.1)
-        
         if not state_mode:
-            ax_smooth.set_title('Head probabilities + local runtime accuracy', fontweight='bold', fontsize=10)
+            ax_smooth.set_title('Head probabilities', fontweight='bold', fontsize=10)
         ax_smooth.grid(True, alpha=0.25)
         legend_lines, legend_labels = ax_smooth.get_legend_handles_labels()
-        if ax_acc is not None:
-            acc_lines, acc_labels = ax_acc.get_legend_handles_labels()
-            legend_lines += acc_lines
-            legend_labels += acc_labels
-        if eeg_raw_stored is not None and len(eeg_raw_stored) > 0 and np.any(np.isfinite(eeg_raw_stored)):
-            eeg_lines, eeg_labels = ax_eeg_overlay.get_legend_handles_labels()
-            legend_lines += eeg_lines
-            legend_labels += eeg_labels
-        ax_smooth.legend(legend_lines, legend_labels, loc='upper right', fontsize=7)
+        _place_panel_legend(ax_smooth, legend_lines, legend_labels, fontsize=7)
 
         # ── Left-heat: inference heatmap ────────────────────────────────────────
         ax_heat = fig.add_subplot(grid[row_heat, 0], sharex=ax_signal)
@@ -814,7 +895,7 @@ class SignalVisualizer:
                 alert_smooth,
                 imminent_prob,
             ]
-            ytick_labels = ['No-risk Prob', 'Alert Prob', 'Smoothed Alert', 'Imminent Prob']
+            ytick_labels = ['No-risk Prob', 'Alarm Prob', 'Smoothed Alarm', 'Imminent Prob']
             ytick_pos = [0.5 + idx for idx in range(len(heatmap_rows))]
             n_rows = len(heatmap_rows)
 
@@ -839,36 +920,133 @@ class SignalVisualizer:
             ax_heat.set_title('Inference heatmap (probability heads)', fontweight='bold', fontsize=10)
         fig.colorbar(im, ax=ax_heat, fraction=0.035, pad=0.01)
 
-        # ── Left-token waterfall: rolling token occupancy ─────────────────────
+        # ── Left-token context + waterfall ────────────────────────────────────
         if add_token_row:
-            ax_token = fig.add_subplot(grid[row_token, 0], sharex=ax_signal)
-            im_token = ax_token.imshow(
-                token_roll.T,
-                aspect='auto',
-                origin='lower',
-                interpolation='nearest',
-                cmap='magma',
-                vmin=0,
-                vmax=token_vmax,
-                extent=[x_minutes[0], x_minutes[-1] if len(x_minutes) > 1 else 1.0, 0, token_roll.shape[1]],
+            token_summary = _compute_token_context_summary(
+                token_roll if token_roll is not None else np.zeros((n_samples, 1), dtype=np.float32)
             )
-            ax_token.set_ylabel('Token ID')
-            ax_token.set_xlabel('Time (minutes)')
-            title = 'Token Activation Waterfall'
-            if token_window is not None:
-                title += f' (window={token_window})'
-            ax_token.set_title(title, fontweight='bold', fontsize=10)
-            if token_labels is not None and len(token_labels) == token_roll.shape[1]:
-                yticks = np.arange(0.5, token_roll.shape[1] + 0.5, 1.0)
-                if len(token_labels) > 16:
-                    step = int(np.ceil(len(token_labels) / 16.0))
-                    yticks = yticks[::step]
-                    show_labels = token_labels[::step]
-                else:
-                    show_labels = token_labels
-                ax_token.set_yticks(yticks)
-                ax_token.set_yticklabels(show_labels, fontsize=7)
-            fig.colorbar(im_token, ax=ax_token, fraction=0.035, pad=0.01, label='Rolling occupancy')
+            ax_token_ctx = fig.add_subplot(grid[row_token_ctx, 0], sharex=ax_signal)
+            if context_energy is not None:
+                # Instantaneous latent context energy is not currently reliable as a
+                # standalone waveform trace; keep the multi-timescale cascades instead.
+                ctx = np.asarray(context_energy, dtype=np.float32)
+                if np.any(np.isfinite(ctx)):
+                    pass
+            ax_token_ctx.plot(
+                x_minutes,
+                token_summary['dominant_share'],
+                color='darkmagenta',
+                linewidth=1.6,
+                alpha=0.9,
+                label='Dominant token share',
+            )
+            ax_token_ctx.plot(
+                x_minutes,
+                token_summary['mean_strength'],
+                color='slateblue',
+                linewidth=1.2,
+                alpha=0.85,
+                linestyle='--',
+                label='Mean token strength',
+            )
+            ax_token_ctx.set_ylabel('Context / token strength', color='darkmagenta', fontsize=9)
+            ax_token_ctx.tick_params(axis='y', labelcolor='darkmagenta')
+            ax_token_ctx.set_ylim(0.0, max(1.0, float(np.nanmax(token_summary['mean_strength'])) * 1.05 if token_summary['mean_strength'].size else 1.0))
+            ax_token_ctx.grid(True, alpha=0.25)
+
+            ax_token_ctx2 = ax_token_ctx.twinx()
+            ax_token_ctx2.plot(
+                x_minutes,
+                token_summary['certainty'],
+                color='black',
+                linewidth=1.2,
+                alpha=0.8,
+                label='Token certainty (1 - entropy)',
+            )
+            ax_token_ctx2.plot(
+                x_minutes,
+                token_summary['transition_density'],
+                color='tomato',
+                linewidth=1.1,
+                alpha=0.75,
+                linestyle=':',
+                label='Token transition density',
+            )
+
+            # Multi-timescale context cascade (minutes → hours → day proxy).
+            if context_energy is not None and np.any(np.isfinite(context_energy)) and len(x_minutes) >= 2:
+                ctx = np.asarray(context_energy, dtype=np.float32)
+                valid_dx = np.diff(np.asarray(x_minutes, dtype=np.float64))
+                valid_dx = valid_dx[np.isfinite(valid_dx) & (valid_dx > 0)]
+                dt_min = float(np.median(valid_dx)) if valid_dx.size > 0 else 1.0 / 60.0
+                dt_min = max(dt_min, 1e-5)
+
+                ctx_lo = float(np.nanpercentile(ctx, 5.0))
+                ctx_hi = float(np.nanpercentile(ctx, 95.0))
+                if ctx_hi <= ctx_lo:
+                    ctx_hi = ctx_lo + 1.0
+                ctx_norm = np.clip((ctx - ctx_lo) / (ctx_hi - ctx_lo), 0.0, 1.0)
+
+                cascade_specs = [
+                    ('Context 1m', 1.0, '#2ca25f', '-'),
+                    ('Context 15m', 15.0, '#238b45', '--'),
+                    ('Context 3h', 180.0, '#006d2c', '-.'),
+                    ('Context 24h', 1440.0, '#00441b', ':'),
+                ]
+                for label, span_min, color, style in cascade_specs:
+                    window_samples = int(round(span_min / dt_min))
+                    if window_samples <= 1:
+                        cascade = ctx_norm
+                    else:
+                        cascade = _rolling_mean(ctx_norm, min(window_samples, len(ctx_norm)))
+                    ax_token_ctx2.plot(
+                        x_minutes,
+                        cascade,
+                        color=color,
+                        linewidth=1.05,
+                        alpha=0.70,
+                        linestyle=style,
+                        label=f'{label} cascade',
+                    )
+
+            ax_token_ctx2.set_ylabel('Certainty / transitions', color='black', fontsize=9)
+            ax_token_ctx2.tick_params(axis='y', labelcolor='black')
+            ax_token_ctx2.set_ylim(0.0, 1.0)
+            ax_token_ctx.set_title('Token context summary', fontweight='bold', fontsize=10)
+
+            ctx_lines, ctx_labels = ax_token_ctx.get_legend_handles_labels()
+            ctx2_lines, ctx2_labels = ax_token_ctx2.get_legend_handles_labels()
+            _place_panel_legend(ax_token_ctx, ctx_lines + ctx2_lines, ctx_labels + ctx2_labels, fontsize=7)
+
+            if token_roll is not None:
+                ax_token = fig.add_subplot(grid[row_token, 0], sharex=ax_signal)
+                im_token = ax_token.imshow(
+                    token_roll.T,
+                    aspect='auto',
+                    origin='lower',
+                    interpolation='nearest',
+                    cmap='magma',
+                    vmin=0,
+                    vmax=token_vmax,
+                    extent=[x_minutes[0], x_minutes[-1] if len(x_minutes) > 1 else 1.0, 0, token_roll.shape[1]],
+                )
+                ax_token.set_ylabel('Token ID')
+                ax_token.set_xlabel('Time (minutes)')
+                title = 'Token Activation Waterfall'
+                if token_window is not None:
+                    title += f' (window={token_window})'
+                ax_token.set_title(title, fontweight='bold', fontsize=10)
+                if token_labels is not None and len(token_labels) == token_roll.shape[1]:
+                    yticks = np.arange(0.5, token_roll.shape[1] + 0.5, 1.0)
+                    if len(token_labels) > 16:
+                        step = int(np.ceil(len(token_labels) / 16.0))
+                        yticks = yticks[::step]
+                        show_labels = token_labels[::step]
+                    else:
+                        show_labels = token_labels
+                    ax_token.set_yticks(yticks)
+                    ax_token.set_yticklabels(show_labels, fontsize=7)
+                fig.colorbar(im_token, ax=ax_token, fraction=0.035, pad=0.01, label='Rolling occupancy')
 
         # Confusion matrices removed for better visualization clarity
         # (Confusion matrix analysis now available in separate metrics files)

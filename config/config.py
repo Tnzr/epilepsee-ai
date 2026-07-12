@@ -128,6 +128,10 @@ class ModelConfig:
     # Attention
     use_attention: bool = True
     num_attention_heads: int = 4
+
+    # Fast LSTM backend. Enabled by default for training speed; disable only
+    # if a specific deployment/debug path requires the non-cuDNN fallback.
+    use_cudnn_rnn: bool = True
     
     # Multimodal fusion
     fusion_type: str = "early"  # "early", "late", or "hybrid"
@@ -260,6 +264,9 @@ class TrainingConfig:
     distributed: bool = True
     num_gpus: int = 2
     backend: str = "nccl"  # "nccl" for GPU, "gloo" for CPU
+
+    # Visualization
+    visualization_quarters: int = 4  # Save visualizations every 1/visualization_quarters of an epoch
 
     # Checkpointing
     save_interval: int = 5  # Save every N epochs
