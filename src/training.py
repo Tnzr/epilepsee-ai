@@ -717,6 +717,7 @@ def _compute_panel_anomaly_report(
     emg_signal: Optional[np.ndarray] = None,
     mov_signal: Optional[np.ndarray] = None,
     token_roll: Optional[np.ndarray] = None,
+    token_labels: Optional[List[str]] = None,
     context_energy: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
     """Compute automated panel anomaly checks from epoch visualization inputs."""
@@ -779,6 +780,7 @@ def _compute_panel_anomaly_report(
 
     token_stats: Dict[str, object] = {
         "present": token_roll is not None,
+        "semantics": "none",
         "n_channels": 0,
         "dominant_channel_ratio": 0.0,
         "normalized_entropy": 0.0,
@@ -790,6 +792,9 @@ def _compute_panel_anomaly_report(
         "context_energy_std": 0.0,
     }
     if token_roll is not None:
+        labels = [str(label) for label in token_labels] if token_labels is not None else []
+        derived_only = bool(labels) and all(label.startswith("Derived ") for label in labels)
+        token_stats["semantics"] = "derived_diagnostic" if derived_only else "latent_or_mixed"
         tok = np.asarray(token_roll, dtype=np.float32)
         if tok.ndim == 2 and tok.shape[0] > 0 and tok.shape[1] > 0:
             n_ch = int(tok.shape[1])
@@ -831,7 +836,11 @@ def _compute_panel_anomaly_report(
     expected_emg_mov = ds == 'bids'
 
     anomalies: List[str] = []
-    if ecg_span95 < 1e-3 or ecg_near_const_ratio > 0.985:
+    # SeizeIT2 raw ECG is stored in small wearable-voltage units, so a 1 mV
+    # span floor over-flags valid low-amplitude traces as flat. Keep the
+    # temporal near-constant detector strict, but use a smaller absolute span
+    # guard for true flatline detection.
+    if ecg_span95 < 1e-4 or ecg_near_const_ratio > 0.985:
         anomalies.append("ecg_flat_or_near_constant")
     if hr_finite_ratio > 0.0 and hr_plausible_ratio < 0.50:
         anomalies.append("bpm_implausible_range")
@@ -843,9 +852,12 @@ def _compute_panel_anomaly_report(
         anomalies.append("emg_missing_or_flat")
     if expected_emg_mov and (not mov_stats["present"] or float(mov_stats["finite_ratio"]) < 0.50 or float(mov_stats["span95"]) < 1e-4):
         anomalies.append("mov_missing_or_flat")
-    if alert_std < 0.01:
+    # Very low alert variance is only concerning when the monitored slice
+    # contains a meaningful amount of preictal content; on overwhelmingly
+    # interictal slices, a near-flat low alert trace can be appropriate.
+    if alert_std < 0.01 and preictal_ratio >= 0.05:
         anomalies.append("inference_map_low_variance")
-    if token_roll is not None:
+    if token_roll is not None and token_stats.get("semantics") != "derived_diagnostic":
         if float(token_stats["dominant_channel_ratio"]) > 0.95 and float(token_stats["normalized_entropy"]) < 0.20:
             anomalies.append("token_collapse_dominant_channel")
 
@@ -3056,8 +3068,8 @@ class Trainer:
             gt_event_mask[0] = int(gt_binary[0] > 0)
         if len(gt_binary) > 1:
             gt_event_mask[1:] = ((gt_binary[1:] > 0) & (gt_binary[:-1] <= 0)).astype(np.int32)
-        # Build token activation waterfall from longitudinal causal channels
-        # so token rows reflect temporal digestion, not static bucket IDs.
+        # Build a derived-channel waterfall from longitudinal causal signals.
+        # This is a diagnostic visualization, not a learned discrete tokenizer.
         token_roll = None
         token_labels: Optional[List[str]] = None
         token_window = max(1, int(getattr(self.training_config, 'token_waterfall_window', 25)))
@@ -3099,16 +3111,16 @@ class Trainer:
                 imminent,
             ]
             labels: List[str] = [
-                'Alert Raw',
-                'Alert Smoothed',
-                'Alert Low+',
-                'Alert Med+',
-                'Alert High+',
-                'Alert Rising',
-                'Alert Falling',
-                'Alert Persistence',
-                'Local Accuracy',
-                'Imminent Risk',
+                'Derived Alert Raw',
+                'Derived Alert Smoothed',
+                'Derived Alert Low+',
+                'Derived Alert Med+',
+                'Derived Alert High+',
+                'Derived Alert Rising',
+                'Derived Alert Falling',
+                'Derived Alert Persistence',
+                'Derived Local Accuracy',
+                'Derived Imminent Risk',
             ]
 
             if state_mode and pred_onset_prob is not None and pred_preictal_only_prob is not None:
@@ -3123,9 +3135,9 @@ class Trainer:
                     np.clip(np.maximum(d_onset, 0.0) / 0.10, 0.0, 1.0),
                 ])
                 labels.extend([
-                    'Preictal Head',
-                    'Onset Head',
-                    'Onset Rising',
+                    'Derived Preictal Head',
+                    'Derived Onset Head',
+                    'Derived Onset Rising',
                 ])
 
             channel_mat = np.stack(channels, axis=1).astype(np.float32)
@@ -3254,6 +3266,7 @@ class Trainer:
                 emg_signal=None if emg_proxy_raw is None else np.asarray(emg_proxy_raw, dtype=np.float32),
                 mov_signal=None if mov_proxy_raw is None else np.asarray(mov_proxy_raw, dtype=np.float32),
                 token_roll=None if token_roll is None else np.asarray(token_roll, dtype=np.float32),
+                token_labels=token_labels,
                 context_energy=None if context_energy is None else np.asarray(context_energy, dtype=np.float32),
             )
 
@@ -3455,6 +3468,58 @@ class Trainer:
         
         # Create model and optimizer
         model, optimizer, scheduler = self.create_model_optimizer_scheduler()
+
+        # Stabilize class weighting in distributed/stateful regimes by
+        # using a fixed dataset-level positive weight when not explicitly set.
+        # This avoids per-batch weight volatility under heavy imbalance.
+        if bool(getattr(self.config.loss, 'use_class_weighting', False)):
+            explicit_pos_weight = getattr(self.config.loss, 'classification_positive_weight', None)
+            distributed_requested = bool(getattr(self.training_config, 'distributed', False))
+            should_stabilize = bool(self.distributed) or bool(distributed_requested) or bool(stateful_mode)
+
+            if explicit_pos_weight is None and should_stabilize and hasattr(train_dataset, 'preictal_labels'):
+                try:
+                    pre = np.asarray(train_dataset.preictal_labels, dtype=np.float32)
+                    n_pos = float(np.sum(pre > 0.5))
+                    n_total = float(pre.size)
+                    n_neg = max(0.0, n_total - n_pos)
+                    if n_total > 0 and n_pos > 0:
+                        inferred_pos_weight = n_neg / n_pos
+                        max_pw_cfg = getattr(self.config.loss, 'max_positive_weight', None)
+                        max_pw = 200.0 if max_pw_cfg is None else float(max_pw_cfg)
+                        inferred_pos_weight = float(np.clip(inferred_pos_weight, 1.0, max_pw))
+                        self.config.loss.classification_positive_weight = inferred_pos_weight
+                        if self._is_main_process():
+                            logger.info(
+                                "Stabilized class weighting: fixed classification_positive_weight=%.4f "
+                                "(n_pos=%d, n_neg=%d, distributed_active=%s, distributed_requested=%s, stateful=%s)",
+                                inferred_pos_weight,
+                                int(n_pos),
+                                int(n_neg),
+                                bool(self.distributed),
+                                bool(distributed_requested),
+                                bool(stateful_mode),
+                            )
+                    elif self._is_main_process():
+                        logger.warning(
+                            "Skipping class-weight stabilization: no positive samples in train_dataset."
+                        )
+                except Exception as cw_exc:
+                    if self._is_main_process():
+                        logger.warning("Class-weight stabilization skipped due to error: %s", str(cw_exc))
+            elif self._is_main_process() and explicit_pos_weight is not None:
+                logger.info(
+                    "Class weighting uses configured fixed classification_positive_weight=%.4f",
+                    float(explicit_pos_weight),
+                )
+            elif self._is_main_process() and explicit_pos_weight is None:
+                logger.info(
+                    "Class weighting remains dynamic (per-batch pos_weight) because stabilization was not requested. "
+                    "(distributed_active=%s, distributed_requested=%s, stateful=%s)",
+                    bool(self.distributed),
+                    bool(distributed_requested),
+                    bool(stateful_mode),
+                )
         
         # Create loss function — supports 'state' (safe 3-class, no countdown regression)
         # or 'countdown' (legacy regression).  Read from config or auto-detect.

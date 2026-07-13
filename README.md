@@ -61,6 +61,7 @@ cp .env.example .env   # then fill in your values
 | `WANDB_API_KEY` | Weights & Biases API key from https://wandb.ai/authorize |
 
 All training commands also accept `--dataset-root /path/to/data` for one-off overrides.
+For overnight or full-scale training, always use `--wandb-mode online` and ensure `wandb login` has been completed in the active environment before launch.
 Real-data preprocessing caches are persisted under `./models/cache/datasets` by default, so matching reruns can reuse extracted datasets instead of rebuilding them from scratch.
 
 Long-sweep runs use memory-light online preictal augmentation (no offline dataset expansion) when `augment_preictal: true` and `online_preictal_augmentation: true` in config.
@@ -285,8 +286,19 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 # Train then snapshot model/config
 make train-snapshot-eegnet DATASET_ROOT=$BIDS_DATASET_ROOT
 
-# Quantize from saved artifact snapshot
+# Quantize from saved artifact snapshot and export ONNX/TorchScript artifacts
 make quantize-eegnet-artifact
+```
+
+#### 5) Reliable overnight training
+```bash
+# Run a stable overnight DDP training job with W&B online logging
+make train-overnight MODEL=tcn DATASET_ROOT=/mnt/d/Datasets/SeizeIT2 EPOCHS=7 BATCH=32
+```
+
+If you want to validate the pipeline first on a quick real-data subset:
+```bash
+scripts/run_reliable_training.sh --subset --dataset-root /mnt/d/Datasets/SeizeIT2 --wandb-mode online --run-name subset_test -- --model-type tcn
 ```
 
 #### Commands for each model type

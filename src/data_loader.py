@@ -229,14 +229,14 @@ class BIDSDataLoader:
     def get_subjects(self) -> List[str]:
         """Get list of all subject IDs."""
         if self.bids_layout:
-            return self.bids_layout.get_subjects()
+            subjects = self.bids_layout.get_subjects()
         else:
             # Fallback: scan directories
             subjects = []
             for item in self.dataset_root.iterdir():
                 if item.is_dir() and item.name.startswith('sub-'):
                     subjects.append(item.name.replace('sub-', ''))
-            return sorted(subjects)
+        return sorted(subjects)
     
     def load_subject_edf(self, subject_id: str, session_id: str = "01", 
                          datatype: str = "ecg", run_id: Optional[int] = None) -> Tuple[np.ndarray, float]:

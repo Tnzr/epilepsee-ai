@@ -20,6 +20,7 @@ pip-wheel-metadata/
 
 # ─── Virtual environments / Conda ────────────────────────────────────────────
 .venv/
+.venv-gpu/
 venv/
 env/
 .conda/
@@ -117,3 +118,5 @@ site/
 .Spotlight-V100
 .Trashes
 ehthumbs.db
+
+miniconda.sh

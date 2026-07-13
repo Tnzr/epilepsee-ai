@@ -81,13 +81,9 @@ training:
   # ===== NEW: Training mode specification =====
   training_mode: "stateful"  # "stateful" or "stateless"
   batching_strategy: "patient_sequential"  # "patient_sequential" or "random"
-  
-  # ===== NEW: Stateful LSTM parameters =====
-  stateful_lstm:
-    enabled: true
-    hidden_state_detach_interval: 10  # Detach hidden state every 10 batches within patient
-    max_patient_sequence_length: 10000  # Warn if patient data exceeds this
-    reset_hidden_between_epochs: false  # Don't reset between epochs
+  hidden_state_detach_interval: 10  # Detach hidden state every 10 batches within patient
+  max_patient_sequence_length: 10000  # Warn if patient data exceeds this
+  reset_hidden_between_epochs: false  # Don't reset between epochs
   
   # ===== Existing parameters =====
   optimizer: "adam"
@@ -107,19 +103,14 @@ training:
   pin_memory: true
   
   gradient_clip_norm: 1.0
-  gradient_clip_value: null
   
   log_interval: 100
   save_interval: 1
-  validation_interval: 1
   
   # Distributed training (for multi-GPU)
   distributed: false
-  world_size: 1
-  rank: 0
+  num_gpus: 2
   backend: "nccl"
-  master_addr: "localhost"
-  master_port: 29503
 
 # Validation configuration
 validation:

@@ -1,0 +1,65 @@
+experiment_name: "real_sanity_stability_20260713"
+description: "Real SeizeIT2 stability sanity run (focused on alert/anomaly evolution)"
+
+data:
+  dataset_root: "/mnt/d/Datasets/SeizeIT2"
+  data_source: "bids"
+  feature_window_s: 60.0
+  feature_step_s: 1.0
+  pre_ictal_window_s: 600.0
+  train_ratio: 0.60
+  val_ratio: 0.15
+  test_ratio: 0.25
+  random_seed: 42
+
+model:
+  model_type: "tcn"
+  ecg_feature_dim: 14
+  coherent_heads: true
+  dropout: 0.3
+
+loss:
+  classification_weight: 0.3
+  regression_weight: 0.7
+  ranking_weight: 0.0
+  regression_loss: "weighted_mse"
+  weight_tau: 60.0
+  use_class_weighting: true
+  classification_positive_weight: null
+  classification_loss_type: "bce"
+  temporal_focus_tau_min: 5.0
+  classification_temporal_boost: 1.5
+  classification_temporal_max_multiplier: 4.0
+  regression_temporal_boost: 0.5
+  regression_temporal_max_multiplier: 3.0
+  detection_threshold: 0.5
+
+training:
+  optimizer: "adam"
+  learning_rate: 0.001
+  weight_decay: 1.0e-5
+  num_epochs: 6
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  gradient_clip_norm: 1.0
+  use_weighted_sampling: false
+  distributed: true
+  num_gpus: 2
+  backend: "nccl"
+  training_mode: "stateful"
+  batching_strategy: "patient_sequential"
+  save_dir: "./models/real_sanity_stability_20260713"
+  log_dir: "./logs/real_sanity_stability_20260713"
+  log_interval: 100
+  save_best_only: true
+  save_interval: 2
+  use_tensorboard: false
+  preflight_visualization: false
+  preflight_max_val_batches: 0
+
+# These keys are ignored by current config parser but retained for future alignment.
+evaluation:
+  compute_mae: true
+  compute_rmse: true
+  compute_medae: true

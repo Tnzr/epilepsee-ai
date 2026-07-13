@@ -201,6 +201,12 @@ class LossConfig:
     classification_loss_type: str = "bce"  # "bce" or "focal"
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
+
+    # Optional onset-focused auxiliary supervision on the alert head.
+    # Disabled by default; when > 0, adds a masked BCE term that trains
+    # onset-vs-interictal discrimination on the alert probability.
+    onset_aux_weight: float = 0.0
+    onset_aux_window_min: float = 2.0
     
     # Decision threshold for binary classification (lower threshold increases sensitivity)
     detection_threshold: float = 0.50  # Base threshold; epoch panels can adapt from validation data

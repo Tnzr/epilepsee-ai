@@ -159,7 +159,19 @@ def _decode_token(token: int, n_countdown_bins: int, n_prob_bins: int, max_count
 
 
 def _rolling_mean_2d(matrix: np.ndarray, window: int) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float32)
+    if matrix.ndim != 2:
+        raise ValueError(f"Expected 2D matrix, got shape={matrix.shape}")
+
+    n_rows = int(matrix.shape[0])
+    if n_rows == 0:
+        return np.zeros_like(matrix, dtype=np.float32)
+
     window = max(1, int(window))
+    # np.convolve(..., mode='same') returns max(len(signal), len(kernel)).
+    # Cap window to n_rows so each column assignment preserves row count.
+    window = min(window, n_rows)
+
     if window == 1:
         return matrix.astype(np.float32)
 
@@ -369,7 +381,9 @@ def main() -> None:
     ax_corr = fig.add_subplot(gs[3])
     # Compute correlation between token time series
     if token_rolling.shape[1] > 1:
-        corr_matrix = np.corrcoef(token_rolling.T)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            corr_matrix = np.corrcoef(token_rolling.T)
+        corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
         im_corr = ax_corr.imshow(
             corr_matrix,
             aspect="equal",

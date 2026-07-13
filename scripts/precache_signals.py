@@ -8,7 +8,7 @@ multi-GPU run.
 
 Usage:
     python scripts/precache_signals.py \
-        --dataset-root /media/tnzr/HDD11/Datasets/ds005873 \
+    --dataset-root /media/tnzr/HDD11/Datasets/SeizeIT2 \
         [--max-recordings 0]
 """
 import argparse

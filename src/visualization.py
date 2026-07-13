@@ -1012,7 +1012,10 @@ class SignalVisualizer:
             ax_token_ctx2.set_ylabel('Certainty / transitions', color='black', fontsize=9)
             ax_token_ctx2.tick_params(axis='y', labelcolor='black')
             ax_token_ctx2.set_ylim(0.0, 1.0)
-            ax_token_ctx.set_title('Token context summary', fontweight='bold', fontsize=10)
+            if context_energy is not None:
+                ax_token_ctx.set_title('Derived token context + learned latent cascades', fontweight='bold', fontsize=10)
+            else:
+                ax_token_ctx.set_title('Derived token context summary (no learned latent context)', fontweight='bold', fontsize=10)
 
             ctx_lines, ctx_labels = ax_token_ctx.get_legend_handles_labels()
             ctx2_lines, ctx2_labels = ax_token_ctx2.get_legend_handles_labels()
@@ -1032,7 +1035,7 @@ class SignalVisualizer:
                 )
                 ax_token.set_ylabel('Token ID')
                 ax_token.set_xlabel('Time (minutes)')
-                title = 'Token Activation Waterfall'
+                title = 'Derived Context Channel Waterfall'
                 if token_window is not None:
                     title += f' (window={token_window})'
                 ax_token.set_title(title, fontweight='bold', fontsize=10)

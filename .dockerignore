@@ -1,0 +1,44 @@
+# Ignore Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore model outputs and results
+models/
+visualizations/
+wandb/
+
+# Ignore egg-info and build artifacts
+epilepsee_ai.egg-info/
+*.egg-info/
+build/
+dist/
+
+# Ignore test outputs
+test_visualizations/
+
+# Ignore environment and config files that shouldn't be copied
+env/
+*.env
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore documentation and reports
+*.md
+*.pdf
+*.docx
+
+# Ignore Docker and VSCode workspace files
+*.code-workspace
+*.dockerignore
+
+# Ignore other common files
+*.log
+*.tmp
+*.bak

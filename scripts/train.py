@@ -403,7 +403,7 @@ def parse_args():
             # Server / Cloud
             'temporal_transformer', 'multimodal_transformer',
         ],
-        default='ecg_lstm',
+        default=None,
         help=(
             'Model architecture. '
             'TinyML/edge: eegnet (ESP32), mobilenet_1d (smartwatch), tcn, inception_1d. '
@@ -414,22 +414,44 @@ def parse_args():
     parser.add_argument(
         '--batch-size',
         type=int,
-        default=32,
-        help='Batch size'
+        default=None,
+        help='Batch size (overrides config.training.batch_size when set)'
     )
     
     parser.add_argument(
         '--epochs',
         type=int,
-        default=100,
-        help='Number of epochs'
+        default=None,
+        help='Number of epochs (overrides config.training.num_epochs when set)'
+    )
+
+    parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=None,
+        help='Number of DataLoader worker processes. Overrides config.training.num_workers when set.'
+    )
+
+    parser.add_argument(
+        '--pin-memory',
+        dest='pin_memory',
+        action='store_true',
+        default=None,
+        help='Enable pin_memory for DataLoader transfers to GPU.'
+    )
+
+    parser.add_argument(
+        '--no-pin-memory',
+        dest='pin_memory',
+        action='store_false',
+        help='Disable pin_memory for DataLoader transfers to GPU.'
     )
     
     parser.add_argument(
         '--learning-rate',
         type=float,
-        default=1e-3,
-        help='Learning rate'
+        default=None,
+        help='Learning rate (overrides config.training.learning_rate when set)'
     )
     
     parser.add_argument(
@@ -634,7 +656,7 @@ def parse_args():
     parser.add_argument(
         '--auto-threshold',
         action='store_true',
-        help='Run threshold sweep on test predictions and save selected threshold'
+        help='Run threshold sweep on validation predictions and apply selected threshold to test metrics'
     )
 
     parser.add_argument(
@@ -1712,8 +1734,15 @@ def _prepare_real_datasets(config: Config, args, loader: BIDSDataLoader, recordi
     is_multimodal = _MF.is_multimodal(config.model.model_type)
 
     ecg_dim = int(config.model.ecg_feature_dim)
-    # For now lazy streaming only supports ECG-only models; multimodal can be
-    # extended later by adding EEG/motion binary caches.
+    # Lazy real BIDS streaming currently materializes ECG features only.
+    # Enforce a hard fail for multimodal model types to prevent silent
+    # methodology drift where EEG/motion branches receive no true inputs.
+    if is_multimodal:
+        raise ValueError(
+            "Invalid configuration: real-mode BIDS lazy streaming is ECG-only, "
+            f"but model_type='{config.model.model_type}' is multimodal. "
+            "Use a non-lazy multimodal preparation path or switch to a single-branch model."
+        )
     feature_dim = ecg_dim
 
     logger.info("REAL mode (lazy): ECG feature dim=%d", feature_dim)
@@ -2761,10 +2790,18 @@ def main():
         config = DEFAULT_CONFIG
     
     # Override with command line args
-    config.model.model_type = args.model_type
-    config.training.batch_size = args.batch_size
-    config.training.num_epochs = args.epochs
-    config.training.learning_rate = args.learning_rate
+    if args.model_type is not None:
+        config.model.model_type = args.model_type
+    if args.batch_size is not None:
+        config.training.batch_size = args.batch_size
+    if args.epochs is not None:
+        config.training.num_epochs = args.epochs
+    if args.learning_rate is not None:
+        config.training.learning_rate = args.learning_rate
+    if args.num_workers is not None:
+        config.training.num_workers = int(args.num_workers)
+    if args.pin_memory is not None:
+        config.training.pin_memory = bool(args.pin_memory)
     if args.real_stride_seconds is not None:
         config.data.feature_step_s = float(args.real_stride_seconds)
     if args.patient_sequential:
@@ -2900,8 +2937,39 @@ def main():
     logger.info("Evaluating on test set...")
     evaluator = Evaluator(config)
     
-    # Load best model
-    checkpoint = torch.load(trainer.save_dir / "best_model.pt", map_location=device, weights_only=False)
+    # Load evaluation checkpoint.
+    # For eval-only/threshold-only runs (e.g., num_epochs=0), best_model.pt may
+    # not exist in the current save_dir; fall back to resume_from when provided.
+    checkpoint_path = trainer.save_dir / "best_model.pt"
+    if not checkpoint_path.exists():
+        resume_from = getattr(config.training, 'resume_from', None)
+        if resume_from:
+            resume_path = Path(resume_from)
+            if resume_path.exists():
+                checkpoint_path = resume_path
+                logger.info(
+                    "Evaluation checkpoint fallback: using resume_from=%s",
+                    str(checkpoint_path),
+                )
+            else:
+                logger.warning(
+                    "Configured resume_from does not exist: %s",
+                    str(resume_path),
+                )
+        elif (trainer.save_dir / "last_model.pt").exists():
+            checkpoint_path = trainer.save_dir / "last_model.pt"
+            logger.info(
+                "Evaluation checkpoint fallback: using %s",
+                str(checkpoint_path),
+            )
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"No evaluation checkpoint found. Looked for {trainer.save_dir / 'best_model.pt'} "
+            f"and fallback resume_from={getattr(config.training, 'resume_from', None)}"
+        )
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     from src import ModelFactory
     model = ModelFactory.create_model(config.model)
     model.load_state_dict(checkpoint['model_state'])
@@ -2938,17 +3006,19 @@ def main():
 
     threshold_sweep = None
     if args.auto_threshold:
+        calibration_payload = evaluator.collect_predictions(model, val_dataset, device)
         threshold_sweep = evaluator.select_optimal_threshold(
-            prediction_payload['pred_preictal'],
-            prediction_payload['true_preictal'],
+            calibration_payload['pred_preictal'],
+            calibration_payload['true_preictal'],
             objective=args.threshold_objective,
             min_sensitivity=float(np.clip(args.threshold_min_sensitivity, 0.0, 1.0)),
             max_fpr=float(np.clip(args.threshold_max_fpr, 0.0, 1.0)),
         )
+        threshold_sweep['calibration_split'] = 'validation'
         selected_threshold = float(threshold_sweep['threshold'])
         config.loss.detection_threshold = selected_threshold
         logger.info(
-            "Auto-threshold selected: %.3f (objective=%s, sens=%.3f, spec=%.3f, fpr=%.3f)",
+            "Auto-threshold selected from validation split: %.3f (objective=%s, sens=%.3f, spec=%.3f, fpr=%.3f)",
             selected_threshold,
             args.threshold_objective,
             threshold_sweep['sensitivity'],

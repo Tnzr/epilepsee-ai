@@ -51,6 +51,7 @@ class SeizureCountdownLoss(nn.Module):
         # Classification loss
         self.classification_loss_type = getattr(config, "classification_loss_type", "bce")
         self.bce_loss = nn.BCELoss(reduction='mean')
+        self.label_smoothing = float(getattr(config, 'label_smoothing', 0.0))
         # Focal loss instance (used when classification_loss_type == "focal")
         self.focal_loss = FocalLoss(
             alpha=getattr(config, "focal_alpha", 0.25),
@@ -80,6 +81,8 @@ class SeizureCountdownLoss(nn.Module):
         self.regression_temporal_max_multiplier = float(
             getattr(config, 'regression_temporal_max_multiplier', 3.0)
         )
+        self.onset_aux_weight = max(0.0, float(getattr(config, 'onset_aux_weight', 0.0)))
+        self.onset_aux_window_min = max(1e-3, float(getattr(config, 'onset_aux_window_min', 2.0)))
 
     def _temporal_multiplier(
         self,
@@ -119,6 +122,11 @@ class SeizureCountdownLoss(nn.Module):
         # Always clamp predicted probabilities away from 0/1 to avoid
         # log(0) → inf inside BCE when the model saturates.
         pred = torch.clamp(pre_ictal_pred, 1e-6, 1 - 1e-6)
+        smooth = float(np.clip(self.label_smoothing, 0.0, 0.49))
+        if smooth > 0.0:
+            pre_ictal_target = pre_ictal_true * (1.0 - smooth) + 0.5 * smooth
+        else:
+            pre_ictal_target = pre_ictal_true
 
         class_temporal_multiplier = self._temporal_multiplier(
             countdown_true,
@@ -130,7 +138,7 @@ class SeizureCountdownLoss(nn.Module):
             # Focal loss variant for heavy imbalance. Class weighting is
             # encoded via focal_alpha in the config rather than
             # per-batch pos_weight.
-            focal_per_sample = self.focal_loss(pred, pre_ictal_true, reduction='none')
+            focal_per_sample = self.focal_loss(pred, pre_ictal_target, reduction='none')
             weighted_focal = focal_per_sample * class_temporal_multiplier
             bce_loss = torch.sum(weighted_focal) / (torch.sum(class_temporal_multiplier) + 1e-8)
         elif self.use_class_weighting:
@@ -153,15 +161,36 @@ class SeizureCountdownLoss(nn.Module):
             pos_weight = torch.clamp(pos_weight, min=1.0, max=self.max_positive_weight)
 
             bce_per_sample = -(
-                pos_weight * pre_ictal_true * torch.log(pred)
-                + (1.0 - pre_ictal_true) * torch.log(1.0 - pred)
+                pos_weight * pre_ictal_target * torch.log(pred)
+                + (1.0 - pre_ictal_target) * torch.log(1.0 - pred)
             )
             weighted_bce = bce_per_sample * class_temporal_multiplier
             bce_loss = torch.sum(weighted_bce) / (torch.sum(class_temporal_multiplier) + 1e-8)
         else:
-            bce_per_sample = F.binary_cross_entropy(pred, pre_ictal_true, reduction='none')
+            bce_per_sample = F.binary_cross_entropy(pred, pre_ictal_target, reduction='none')
             weighted_bce = bce_per_sample * class_temporal_multiplier
             bce_loss = torch.sum(weighted_bce) / (torch.sum(class_temporal_multiplier) + 1e-8)
+
+        onset_aux_loss = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        if self.onset_aux_weight > 0.0:
+            # Train an auxiliary onset-vs-interictal objective on the alert head,
+            # while ignoring far-preictal samples to avoid conflicting targets.
+            onset_mask = (countdown_true >= 0.0) & (countdown_true < self.onset_aux_window_min)
+            interictal_mask = countdown_true < 0.0
+            aux_mask = (onset_mask | interictal_mask).float()
+            aux_target = onset_mask.float()
+
+            pos_count = torch.sum(aux_target * aux_mask)
+            neg_count = torch.sum((1.0 - aux_target) * aux_mask)
+            aux_pos_weight = (neg_count + 1e-6) / (pos_count + 1e-6)
+            aux_pos_weight = torch.clamp(aux_pos_weight, min=1.0, max=self.max_positive_weight)
+
+            aux_per_sample = -(
+                aux_pos_weight * aux_target * torch.log(pred)
+                + (1.0 - aux_target) * torch.log(1.0 - pred)
+            )
+            aux_weights = aux_mask * class_temporal_multiplier
+            onset_aux_loss = torch.sum(aux_per_sample * aux_weights) / (torch.sum(aux_weights) + 1e-8)
         
         # 2. Regression loss: Weighted MSE (only on preictal samples)
         # Create mask that zeros out interictal samples but keeps gradients flowing
@@ -190,15 +219,20 @@ class SeizureCountdownLoss(nn.Module):
         ranking_loss = self._compute_ranking_loss(countdown_pred, countdown_true)
         
         # Total loss
-        total_loss = (self.alpha * bce_loss + 
-                     self.beta * regression_loss + 
-                     self.gamma * ranking_loss)
+        total_weight = self.alpha + self.beta + self.gamma + self.onset_aux_weight + 1e-8
+        total_loss = (
+            self.alpha * bce_loss
+            + self.beta * regression_loss
+            + self.gamma * ranking_loss
+            + self.onset_aux_weight * onset_aux_loss
+        ) / total_weight
         
         return {
             'total': total_loss,
             'classification': bce_loss,
             'regression': regression_loss,
             'ranking': ranking_loss,
+            'onset_aux': onset_aux_loss,
         }
     
     def _compute_ranking_loss(self, countdown_pred: torch.Tensor, 
