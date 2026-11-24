@@ -919,9 +919,9 @@ Binary seizure detection (yes/no) provides limited clinical utility. **Countdown
 
 ---
 
-## 📄 License
+## License
 
-This project is licensed under the MIT License - see LICENSE file for details.
+Source code is released under the MIT License (see LICENSE). Datasets, pretrained third-party models and their documentation keep their own licenses.
 
 ---
 
